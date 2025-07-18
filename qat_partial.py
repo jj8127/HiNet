@@ -39,9 +39,30 @@ def load_pretrained(model, path=None):
         print(f"warning: pretrained model not found at {path}")
         return
     state = torch.load(path, map_location=device)
-    if isinstance(state, dict) and 'net' in state:
-        state = state['net']
-    model.load_state_dict(state)
+    if isinstance(state, dict):
+        # handle checkpoints saved with different wrappers
+        if 'net' in state:
+            state = state['net']
+        elif 'state_dict' in state:
+            state = state['state_dict']
+        elif 'model' in state and isinstance(state['model'], dict):
+            state = state['model']
+    # strip common prefixes such as 'module.' or 'model.'
+    new_state = {}
+    for k, v in state.items():
+        name = k
+        if name.startswith('module.model.'):
+            name = name[len('module.model.') :]
+        elif name.startswith('module.'):
+            name = name[len('module.') :]
+        if name.startswith('model.'):
+            name = name[len('model.') :]
+        new_state[name] = v
+    missing, unexpected = model.load_state_dict(new_state, strict=False)
+    if missing:
+        print(f"warning: missing keys {missing}")
+    if unexpected:
+        print(f"warning: unexpected keys {unexpected}")
     print(f"loaded pretrained weights from {path}")
 
 

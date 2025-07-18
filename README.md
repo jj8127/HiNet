@@ -79,6 +79,28 @@ python demo_quantized.py --model model/model_qat_YYYYMMDD-HHMMSS.pt
 ## Partial INT8 Quantization
 The script `qat_partial.py` demonstrates how to apply mixed precision
 quantization aware training (QAT). All `nn.Conv2d` layers are quantized while
+the `INV_block` modules remain in full precision. The training loop reuses the
+same guide/reconstruction/low-frequency losses from `train.py` so the
+quantized model keeps the original quality. After calibration the script saves
+`model/model_qat_YYYYMMDD-HHMMSS.pt` which can be deployed on devices such as
+Raspberry Pi. Per-step loss and PSNR for both the cover and recovered secret
+images are printed for quick verification.
+
+Run the example:
+
+```bash
+python qat_partial.py --pretrained /path/to/model.pt --steps 10
+```
+
+After conversion, run the demo script to save sample stego and recovered images:
+
+```bash
+python demo_quantized.py --model model/model_qat_YYYYMMDD-HHMMSS.pt
+```
+
+## Partial INT8 Quantization
+The script `qat_partial.py` demonstrates how to apply mixed precision
+quantization aware training (QAT). All `nn.Conv2d` layers are quantized while
 the `INV_block` modules remain in full precision. After a short calibration the
 script saves `model/model_qat_YYYYMMDD-HHMMSS.pt` which can be deployed on
 devices such as Raspberry Pi. The script prints the loss for every training
