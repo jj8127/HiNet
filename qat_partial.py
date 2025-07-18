@@ -4,7 +4,7 @@ import torch.ao.quantization as tq
 import torch.nn.functional as F
 import numpy as np
 import os
-from datetime import datetime
+import torchvision
 
 from hinet import Hinet
 from invblock import INV_block
@@ -17,9 +17,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def mark_quant_layers(module):
+    """Recursively assign QAT qconfig to convolution layers."""
     for child in module.children():
-        if isinstance(child, INV_block):
-            continue
         if isinstance(child, nn.Conv2d):
             child.qconfig = tq.get_default_qat_qconfig("fbgemm")
         mark_quant_layers(child)
@@ -75,7 +74,7 @@ def train(model, epochs=1):
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
-        for data in datasets.trainloader:
+        for step, data in enumerate(datasets.trainloader, start=1):
             data = data.to(device)
             half = data.size(0) // 2
             cover = data[half:]
@@ -109,6 +108,7 @@ def train(model, epochs=1):
             loss.backward()
             optim.step()
             epoch_loss += loss.item()
+            print(f"epoch {epoch + 1} step {step}: loss {loss.item():.6f}")
 
         avg = epoch_loss / max(1, len(datasets.trainloader))
         print(f"epoch {epoch + 1}: loss {avg:.6f}")
@@ -147,14 +147,15 @@ def psnr(img1, img2):
     return 10 * torch.log10(1.0 / mse).item()
 
 
-def evaluate(model):
+def evaluate(model, save_samples: bool = False):
     dwt = common.DWT().to(device)
     iwt = common.IWT().to(device)
     model.eval()
     scores_cover = []
     scores_secret = []
+    saved = False
     with torch.no_grad():
-        for data in datasets.testloader:
+        for idx, data in enumerate(datasets.testloader):
             data = data.to(device)
             cover = data[data.size(0) // 2 :]
             secret = data[: data.size(0) // 2]
@@ -169,6 +170,16 @@ def evaluate(model):
             secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in))
             scores_cover.append(psnr(steg, cover))
             scores_secret.append(psnr(secret_rev, secret))
+            if save_samples and not saved:
+                os.makedirs(c.IMAGE_PATH_cover, exist_ok=True)
+                os.makedirs(c.IMAGE_PATH_secret, exist_ok=True)
+                os.makedirs(c.IMAGE_PATH_steg, exist_ok=True)
+                os.makedirs(c.IMAGE_PATH_secret_rev, exist_ok=True)
+                torchvision.utils.save_image(cover, os.path.join(c.IMAGE_PATH_cover, f"{idx:05d}.png"))
+                torchvision.utils.save_image(secret, os.path.join(c.IMAGE_PATH_secret, f"{idx:05d}.png"))
+                torchvision.utils.save_image(steg.clamp(0, 1), os.path.join(c.IMAGE_PATH_steg, f"{idx:05d}.png"))
+                torchvision.utils.save_image(secret_rev.clamp(0, 1), os.path.join(c.IMAGE_PATH_secret_rev, f"{idx:05d}.png"))
+                saved = True
     mean_cover = float(np.mean(scores_cover))
     mean_secret = float(np.mean(scores_secret))
     print(f"PSNR cover: {mean_cover:.2f} dB, secret: {mean_secret:.2f} dB")
@@ -181,7 +192,7 @@ def main(pretrained=None, epochs=1, calib_steps=5):
     train(model, epochs=epochs)
     calibrate(model, steps=calib_steps)
     qmodel = convert(model)
-    evaluate(qmodel.to(device))
+    evaluate(qmodel.to(device), save_samples=True)
     os.makedirs("model", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     save_path = os.path.join("model", f"model_qat_{timestamp}.pt")
