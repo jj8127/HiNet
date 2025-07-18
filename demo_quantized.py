@@ -12,6 +12,8 @@ import modules.Unet_common as common
 import datasets
 import config as c
 
+torch.backends.quantized.engine = "fbgemm"
+
 
 # quantized ops run on CPU
 device = torch.device("cpu")

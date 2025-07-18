@@ -68,6 +68,37 @@ image-hiding process for a number of epochs before calibration.
 
 Quantized convolution kernels run only on CPU, therefore evaluation and
 `demo_quantized.py` will automatically use the CPU even if a GPU is present.
+If you encounter an error about `quantized::conv2d.new` missing on CPU,
+explicitly set `torch.backends.quantized.engine = "fbgemm"` before loading the
+model. The example scripts already do this.
+
+Run the example:
+
+```bash
+python qat_partial.py --pretrained /path/to/model.pt \
+                     --epochs 5 --calib-steps 10
+```
+
+After conversion, run the demo script to save sample stego and recovered images:
+
+```bash
+python demo_quantized.py --model model/model_qat_YYYYMMDD-HHMMSS.pt
+```
+
+## Partial INT8 Quantization
+The script `qat_partial.py` demonstrates how to apply mixed precision
+quantization aware training (QAT). All convolution layers receive QAT
+configuration while non-convolution operations stay in full precision. The
+training loop reuses the same guide, reconstruction and low-frequency losses
+from `train.py` so the quantized model preserves quality. After calibration the
+script saves `model/model_qat_YYYYMMDD-HHMMSS.pt` which can be deployed on
+devices such as Raspberry Pi. Per-step loss and PSNR for both the cover and
+recovered secret images are printed and the first validation batch is exported
+to the `image` folder for quick inspection. The script now trains the actual
+image-hiding process for a number of epochs before calibration.
+
+Quantized convolution kernels run only on CPU, therefore evaluation and
+`demo_quantized.py` will automatically use the CPU even if a GPU is present.
 
 Run the example:
 

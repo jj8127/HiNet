@@ -13,6 +13,8 @@ import datasets
 import modules.Unet_common as common
 import config as c
 
+torch.backends.quantized.engine = "fbgemm"
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
