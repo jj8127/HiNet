@@ -29,6 +29,7 @@ def prepare_model_for_qat(model):
 
 
 def train_dummy(model, steps=10):
+
     optim = torch.optim.Adam(model.parameters(), lr=1e-4)
     loader = iter(datasets.trainloader)
     for _ in range(steps):
