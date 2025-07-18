@@ -30,7 +30,10 @@ def prepare_model_for_qat(model):
 
 def train_dummy(model, steps=10):
 
+    """Run a few QAT steps using the training loader."""
     optim = torch.optim.Adam(model.parameters(), lr=1e-4)
+    dwt = common.DWT().to(device)
+
     loader = iter(datasets.trainloader)
     for _ in range(steps):
         try:
@@ -39,7 +42,12 @@ def train_dummy(model, steps=10):
             loader = iter(datasets.trainloader)
             data = next(loader)
         data = data.to(device)
-        out = model(data)
+        half = data.size(0) // 2
+        cover = data[half:]
+        secret = data[:half]
+        input_img = torch.cat((dwt(cover), dwt(secret)), 1)
+        assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
+        out = model(input_img)
         loss = out.abs().mean()
         optim.zero_grad()
         loss.backward()
@@ -47,7 +55,9 @@ def train_dummy(model, steps=10):
 
 
 def calibrate(model, steps=5):
+    """Run a short calibration on a few training batches."""
     model.eval()
+    dwt = common.DWT().to(device)
     loader = iter(datasets.trainloader)
     with torch.no_grad():
         for _ in range(steps):
@@ -57,7 +67,12 @@ def calibrate(model, steps=5):
                 loader = iter(datasets.trainloader)
                 data = next(loader)
             data = data.to(device)
-            model(data)
+            half = data.size(0) // 2
+            cover = data[half:]
+            secret = data[:half]
+            input_img = torch.cat((dwt(cover), dwt(secret)), 1)
+            assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
+            model(input_img)
 
 
 def convert(model):
