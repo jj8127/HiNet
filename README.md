@@ -66,6 +66,20 @@ Run the example:
 
 ```bash
 python qat_partial.py
+``'
+
+## Partial INT8 Quantization
+The script `qat_partial.py` demonstrates how to apply mixed precision
+quantization aware training (QAT). All `nn.Conv2d` layers are quantized while
+the `INV_block` modules remain in full precision. After a short calibration the
+script exports `hinet_qat_int8.pth` which can be deployed on devices such as
+Raspberry Pi. The script also prints a simple PSNR score to verify that the
+quantized model produces reasonable outputs.
+
+Run the example:
+
+```bash
+python qat_partial.py
 ```
 
 
