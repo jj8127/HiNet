@@ -14,8 +14,7 @@ By [MC2 Lab](http://buaamc2.net/) @ [Beihang University](http://ev.buaa.edu.cn/)
 ## Dependencies and Installation
 - Python 3 (Recommend to use [Anaconda](https://www.anaconda.com/download/#linux)).
 - [PyTorch >= 2.7.1+cu118](https://pytorch.org/).
-- See `environment_torch2.yml` for a sample conda environment using the
-  CUDA 11.8 wheels.
+- See `environment_torch2.yml` for a sample conda environment.
 
 Create the environment and activate it:
 

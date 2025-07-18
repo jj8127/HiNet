@@ -29,9 +29,8 @@ def prepare_model_for_qat(model):
 
 
 def train_dummy(model, steps=10):
-    """Run a few QAT steps using the training loader."""
+
     optim = torch.optim.Adam(model.parameters(), lr=1e-4)
-    dwt = common.DWT().to(device)
     loader = iter(datasets.trainloader)
     for _ in range(steps):
         try:
@@ -40,12 +39,7 @@ def train_dummy(model, steps=10):
             loader = iter(datasets.trainloader)
             data = next(loader)
         data = data.to(device)
-        cover = data[data.size(0) // 2 :]
-        secret = data[: data.size(0) // 2]
-        cover_in = dwt(cover)
-        secret_in = dwt(secret)
-        input_img = torch.cat((cover_in, secret_in), 1)
-        out = model(input_img)
+        out = model(data)
         loss = out.abs().mean()
         optim.zero_grad()
         loss.backward()
@@ -53,9 +47,7 @@ def train_dummy(model, steps=10):
 
 
 def calibrate(model, steps=5):
-    """Run a short calibration on a few training batches."""
     model.eval()
-    dwt = common.DWT().to(device)
     loader = iter(datasets.trainloader)
     with torch.no_grad():
         for _ in range(steps):
@@ -65,12 +57,7 @@ def calibrate(model, steps=5):
                 loader = iter(datasets.trainloader)
                 data = next(loader)
             data = data.to(device)
-            cover = data[data.size(0) // 2 :]
-            secret = data[: data.size(0) // 2]
-            cover_in = dwt(cover)
-            secret_in = dwt(secret)
-            input_img = torch.cat((cover_in, secret_in), 1)
-            model(input_img)
+            model(data)
 
 
 def convert(model):
