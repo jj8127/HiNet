@@ -5,7 +5,6 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import torchvision
-from datetime import datetime
 
 from hinet import Hinet
 from invblock import INV_block
