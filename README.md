@@ -13,8 +13,16 @@ By [MC2 Lab](http://buaamc2.net/) @ [Beihang University](http://ev.buaa.edu.cn/)
  
 ## Dependencies and Installation
 - Python 3 (Recommend to use [Anaconda](https://www.anaconda.com/download/#linux)).
-- [PyTorch = 1.0.1](https://pytorch.org/) .
-- See [environment.yml](https://github.com/TomTomTommi/HiNet/blob/main/environment.yml) for other dependencies.
+- [PyTorch >= 2.7.1+cu118](https://pytorch.org/).
+- See `environment_torch2.yml` for a sample conda environment using the
+  CUDA 11.8 wheels.
+
+Create the environment and activate it:
+
+```bash
+conda env create -f environment_torch2.yml
+conda activate hinet_pytorch2
+```
 
 
 ## Get Started
@@ -43,8 +51,32 @@ By [MC2 Lab](http://buaamc2.net/) @ [Beihang University](http://ev.buaa.edu.cn/)
 
 - Fill in the `MODEL_PATH` and the file name `suffix` before testing by the trained model.
 
-- For example, if the model name is `model.pt` and its path is `/home/usrname/Hinet/model/`, 
+- For example, if the model name is `model.pt` and its path is `/home/usrname/Hinet/model/`,
 set `MODEL_PATH = '/home/usrname/Hinet/model/'` and file name `suffix = 'model.pt'`.
+
+## Partial INT8 Quantization
+The script `qat_partial.py` demonstrates how to apply mixed precision
+quantization aware training (QAT). All `nn.Conv2d` layers are quantized while
+the `INV_block` modules remain in full precision. The training loop reuses the
+same guide/reconstruction/low-frequency losses from `train.py` so the
+quantized model keeps the original quality. After calibration the script saves
+`model/model_qat_YYYYMMDD-HHMMSS.pt` which can be deployed on devices such as
+Raspberry Pi. Per-step loss and PSNR for both the cover and recovered secret
+images are printed for quick verification.  The script now trains the actual
+image-hiding process for a number of epochs before calibration.
+
+Run the example:
+
+```bash
+python qat_partial.py --pretrained /path/to/model.pt \
+                     --epochs 5 --calib-steps 10
+```
+
+After conversion, run the demo script to save sample stego and recovered images:
+
+```bash
+python demo_quantized.py --model model/model_qat_YYYYMMDD-HHMMSS.pt
+```
 
 
 ## Training Demo (2021/12/25 Updated)
