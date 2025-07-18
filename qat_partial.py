@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.ao.quantization as tq
 import numpy as np
+import os
+from datetime import datetime
 
 from hinet import Hinet
 from invblock import INV_block
@@ -33,7 +35,7 @@ def train_dummy(model, steps=10):
     optim = torch.optim.Adam(model.parameters(), lr=1e-4)
     dwt = common.DWT().to(device)
     loader = iter(datasets.trainloader)
-    for _ in range(steps):
+    for step in range(1, steps + 1):
         try:
             data = next(loader)
         except StopIteration:
@@ -50,6 +52,7 @@ def train_dummy(model, steps=10):
         optim.zero_grad()
         loss.backward()
         optim.step()
+        print(f"step {step}: loss {loss.item():.6f}")
 
 
 def calibrate(model, steps=5):
@@ -112,8 +115,11 @@ def main():
     calibrate(model, steps=2)
     qmodel = convert(model)
     evaluate(qmodel.to(device))
-    torch.save(qmodel.state_dict(), "hinet_qat_int8.pth")
-    print("quantized model saved")
+    os.makedirs("model", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    save_path = os.path.join("model", f"model_qat_{timestamp}.pt")
+    torch.save(qmodel.state_dict(), save_path)
+    print(f"quantized model saved to {save_path}")
 
 
 if __name__ == "__main__":
