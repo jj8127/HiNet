@@ -1,4 +1,4 @@
-from model import *
+import torch.nn as nn
 from invblock import INV_block
 
 
