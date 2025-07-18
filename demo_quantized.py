@@ -13,7 +13,8 @@ import datasets
 import config as c
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# quantized ops run on CPU
+device = torch.device("cpu")
 
 
 def mark_quant_layers(module):

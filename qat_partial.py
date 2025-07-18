@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import torchvision
+from datetime import datetime
 
 from hinet import Hinet
 from invblock import INV_block
@@ -147,16 +148,17 @@ def psnr(img1, img2):
     return 10 * torch.log10(1.0 / mse).item()
 
 
-def evaluate(model, save_samples: bool = False):
-    dwt = common.DWT().to(device)
-    iwt = common.IWT().to(device)
+def evaluate(model, save_samples: bool = False, device=torch.device("cpu")):
+    eval_device = device
+    dwt = common.DWT().to(eval_device)
+    iwt = common.IWT().to(eval_device)
     model.eval()
     scores_cover = []
     scores_secret = []
     saved = False
     with torch.no_grad():
         for idx, data in enumerate(datasets.testloader):
-            data = data.to(device)
+            data = data.to(eval_device)
             cover = data[data.size(0) // 2 :]
             secret = data[: data.size(0) // 2]
             cover_in = dwt(cover)
@@ -192,7 +194,7 @@ def main(pretrained=None, epochs=1, calib_steps=5):
     train(model, epochs=epochs)
     calibrate(model, steps=calib_steps)
     qmodel = convert(model)
-    evaluate(qmodel.to(device), save_samples=True)
+    evaluate(qmodel, save_samples=True, device=torch.device("cpu"))
     os.makedirs("model", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     save_path = os.path.join("model", f"model_qat_{timestamp}.pt")
