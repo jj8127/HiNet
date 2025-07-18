@@ -1,4 +1,5 @@
-from model import *
+import torch.nn as nn
+import torch.ao.quantization as tq
 from invblock import INV_block
 
 
@@ -6,6 +7,9 @@ class Hinet(nn.Module):
 
     def __init__(self):
         super(Hinet, self).__init__()
+
+        # stubs for QAT/quantized inference
+        self.quant = tq.QuantStub()
 
         self.inv1 = INV_block()
         self.inv2 = INV_block()
@@ -25,7 +29,10 @@ class Hinet(nn.Module):
         self.inv15 = INV_block()
         self.inv16 = INV_block()
 
+        self.dequant = tq.DeQuantStub()
+
     def forward(self, x, rev=False):
+        x = self.quant(x)
 
         if not rev:
             out = self.inv1(x)
@@ -65,6 +72,7 @@ class Hinet(nn.Module):
             out = self.inv2(out, rev=True)
             out = self.inv1(out, rev=True)
 
+        out = self.dequant(out)
         return out
 
 
