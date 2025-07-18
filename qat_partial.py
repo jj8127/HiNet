@@ -13,7 +13,17 @@ import datasets
 import modules.Unet_common as common
 import config as c
 
-torch.backends.quantized.engine = "fbgemm"
+def select_qengine():
+    """Pick a quantization engine supported by the current PyTorch build."""
+    engines = torch.backends.quantized.supported_engines
+    if "fbgemm" in engines:
+        torch.backends.quantized.engine = "fbgemm"
+    elif "qnnpack" in engines:
+        torch.backends.quantized.engine = "qnnpack"
+    else:
+        torch.backends.quantized.engine = engines[0]
+
+select_qengine()
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,7 +33,7 @@ def mark_quant_layers(module):
     """Recursively assign QAT qconfig to convolution layers."""
     for child in module.children():
         if isinstance(child, nn.Conv2d):
-            child.qconfig = tq.get_default_qat_qconfig("fbgemm")
+            child.qconfig = tq.get_default_qat_qconfig(torch.backends.quantized.engine)
         mark_quant_layers(child)
 
 

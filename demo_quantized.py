@@ -12,7 +12,16 @@ import modules.Unet_common as common
 import datasets
 import config as c
 
-torch.backends.quantized.engine = "fbgemm"
+def select_qengine():
+    engines = torch.backends.quantized.supported_engines
+    if "fbgemm" in engines:
+        torch.backends.quantized.engine = "fbgemm"
+    elif "qnnpack" in engines:
+        torch.backends.quantized.engine = "qnnpack"
+    else:
+        torch.backends.quantized.engine = engines[0]
+
+select_qengine()
 
 
 # quantized ops run on CPU
