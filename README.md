@@ -11,6 +11,7 @@ By [MC2 Lab](http://buaamc2.net/) @ [Beihang University](http://ev.buaa.edu.cn/)
   <img src=https://github.com/TomTomTommi/HiNet/blob/main/HiNet.png width=60% />
 </center>
  
+
 ## Dependencies and Installation
 - Python 3 (Recommend to use [Anaconda](https://www.anaconda.com/download/#linux)).
 - [PyTorch >= 2.7.1+cu118](https://pytorch.org/).
@@ -53,6 +54,21 @@ conda activate hinet_pytorch2
 
 - For example, if the model name is `model.pt` and its path is `/home/usrname/Hinet/model/`,
 set `MODEL_PATH = '/home/usrname/Hinet/model/'` and file name `suffix = 'model.pt'`.
+
+## Partial INT8 Quantization
+The script `qat_partial.py` demonstrates how to apply mixed precision
+quantization aware training (QAT). All `nn.Conv2d` layers are quantized while
+the `INV_block` modules remain in full precision. After a short calibration the
+script exports `hinet_qat_int8.pth` which can be deployed on devices such as
+Raspberry Pi. The script also prints a simple PSNR score to verify that the
+quantized model produces reasonable outputs.
+
+Run the example:
+
+```bash
+python qat_partial.py
+```
+
 
 ## Partial INT8 Quantization
 The script `qat_partial.py` demonstrates how to apply mixed precision

@@ -29,11 +29,9 @@ def prepare_model_for_qat(model):
 
 
 def train_dummy(model, steps=10):
-
     """Run a few QAT steps using the training loader."""
     optim = torch.optim.Adam(model.parameters(), lr=1e-4)
     dwt = common.DWT().to(device)
-
     loader = iter(datasets.trainloader)
     for _ in range(steps):
         try:
