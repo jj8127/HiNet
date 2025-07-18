@@ -18,8 +18,9 @@ def select_qengine():
         torch.backends.quantized.engine = "fbgemm"
     elif "qnnpack" in engines:
         torch.backends.quantized.engine = "qnnpack"
-    else:
+    elif engines:
         torch.backends.quantized.engine = engines[0]
+    print(f"using quantization engine: {torch.backends.quantized.engine}")
 
 select_qengine()
 
