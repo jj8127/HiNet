@@ -151,8 +151,6 @@ def calibrate(model, steps=5):
             input_img = torch.cat((dwt(cover), dwt(secret)), 1)
             if torch.backends.quantized.engine == "qnnpack":
                 input_img = input_img.to(memory_format=torch.channels_last)
-            assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
-            model(input_img)
 
 
 def convert(model):

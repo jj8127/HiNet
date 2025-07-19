@@ -42,7 +42,7 @@ progress_bar = False
 
 # Saving checkpoints:
 
-MODEL_PATH = '/root/Desktop/HiNet/model/model.pt/'
+MODEL_PATH = '/root/Desktop/HiNet/model/'
 checkpoint_on_error = True
 SAVE_freq = 50
 
