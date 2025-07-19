@@ -25,10 +25,9 @@ batchsize_val = 2
 shuffle_val = False
 val_freq = 50
 
-
 # Dataset
-TRAIN_PATH = '/root/Desktop/HiNet/data/DIV2K_train_HR/'
-VAL_PATH = '/root/Desktop/HiNet/data/DIV2K_valid_HR/'
+TRAIN_PATH = './data/DIV2K_train_HR/'
+VAL_PATH = './data/DIV2K_valid_HR/'
 format_train = 'png'
 format_val = 'png'
 
@@ -39,14 +38,12 @@ silent = False
 live_visualization = False
 progress_bar = False
 
-
 # Saving checkpoints:
-
-MODEL_PATH = '/root/Desktop/HiNet/model/'
+MODEL_PATH = './model/'
 checkpoint_on_error = True
 SAVE_freq = 50
 
-IMAGE_PATH = '/root/Desktop/HiNet/image/'
+IMAGE_PATH = './image/'
 IMAGE_PATH_cover = IMAGE_PATH + 'cover/'
 IMAGE_PATH_secret = IMAGE_PATH + 'secret/'
 IMAGE_PATH_steg = IMAGE_PATH + 'steg/'

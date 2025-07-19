@@ -20,3 +20,4 @@ def setup_logger(logger_name, root, phase, level=logging.INFO, screen=False, tof
         sh = logging.StreamHandler()
         sh.setFormatter(formatter)
         lg.addHandler(sh)
+    return lg
