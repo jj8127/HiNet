@@ -41,6 +41,8 @@ def mark_quant_layers(module):
 def prepare_model_for_qat(model):
     model.train()
     mark_quant_layers(model)
+    if torch.backends.quantized.engine == "qnnpack":
+        model.to(memory_format=torch.channels_last)
     tq.prepare_qat(model, inplace=True)
 
 
@@ -96,6 +98,8 @@ def train(model, epochs=1):
             cover_in = dwt(cover)
             secret_in = dwt(secret)
             input_img = torch.cat((cover_in, secret_in), 1)
+            if torch.backends.quantized.engine == "qnnpack":
+                input_img = input_img.to(memory_format=torch.channels_last)
 
             output = model(input_img)
             output_steg = output.narrow(1, 0, 4 * c.channels_in)
@@ -145,8 +149,8 @@ def calibrate(model, steps=5):
             cover = data[half:]
             secret = data[:half]
             input_img = torch.cat((dwt(cover), dwt(secret)), 1)
-            assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
-            model(input_img)
+            if torch.backends.quantized.engine == "qnnpack":
+                input_img = input_img.to(memory_format=torch.channels_last)
 
 
 def convert(model):
@@ -177,6 +181,8 @@ def evaluate(model, save_samples: bool = False, device=torch.device("cpu")):
             cover_in = dwt(cover)
             secret_in = dwt(secret)
             input_img = torch.cat((cover_in, secret_in), 1)
+            if torch.backends.quantized.engine == "qnnpack":
+                input_img = input_img.to(memory_format=torch.channels_last)
             output = model(input_img)
             steg = iwt(output.narrow(1, 0, 4 * c.channels_in))
             z = torch.randn_like(output.narrow(1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in))
