@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.ao.quantization as tq
 import modules.module_util as mutil
 
-
 # Dense connection
 class ResidualDenseBlock_out(nn.Module):
     def __init__(self, input, output, bias=True):
