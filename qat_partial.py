@@ -45,11 +45,16 @@ def prepare_model_for_qat(model):
     # fuse conv+activation pairs in dense blocks before preparing
     for m in model.modules():
         if isinstance(m, ResidualDenseBlock_out):
-            tq.fuse_modules(
-                m,
-                [["conv1", "lrelu"], ["conv2", "lrelu"], ["conv3", "lrelu"], ["conv4", "lrelu"]],
-                inplace=True,
-            )
+            try:
+                tq.fuse_modules(
+                    m,
+                    [["conv1", "lrelu"], ["conv2", "lrelu"], ["conv3", "lrelu"], ["conv4", "lrelu"]],
+                    inplace=True,
+                )
+            except AssertionError:
+                # Conv2d + LeakyReLU fusion may be unsupported on some builds
+                # The layer will remain unfused but QAT will still proceed
+                pass
 
     mark_quant_layers(model)
     if torch.backends.quantized.engine == "qnnpack":
