@@ -17,6 +17,9 @@ class Hinet(nn.Module):
         # stubs for QAT/quantized inference
         self.quant = tq.QuantStub()
 
+        # stubs for QAT/quantized inference
+        self.quant = tq.QuantStub()
+
         self.inv1 = INV_block()
         self.inv2 = INV_block()
         self.inv3 = INV_block()
