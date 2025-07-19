@@ -9,6 +9,7 @@ from datetime import datetime
 
 from hinet import Hinet
 from invblock import INV_block
+from rrdb_denselayer import ResidualDenseBlock_out
 import datasets
 import modules.Unet_common as common
 import config as c
@@ -39,7 +40,17 @@ def mark_quant_layers(module):
 
 
 def prepare_model_for_qat(model):
+    """Mark layers for QAT and fuse common patterns."""
     model.train()
+    # fuse conv+activation pairs in dense blocks before preparing
+    for m in model.modules():
+        if isinstance(m, ResidualDenseBlock_out):
+            tq.fuse_modules(
+                m,
+                [["conv1", "lrelu"], ["conv2", "lrelu"], ["conv3", "lrelu"], ["conv4", "lrelu"]],
+                inplace=True,
+            )
+
     mark_quant_layers(model)
     if torch.backends.quantized.engine == "qnnpack":
         model.to(memory_format=torch.channels_last)
@@ -151,6 +162,8 @@ def calibrate(model, steps=5):
             input_img = torch.cat((dwt(cover), dwt(secret)), 1)
             if torch.backends.quantized.engine == "qnnpack":
                 input_img = input_img.to(memory_format=torch.channels_last)
+            assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
+            model(input_img)
 
 
 def convert(model):
