@@ -1,0 +1,16 @@
+name: hinet_pytorch2
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pip:
+      - torch==2.7.1+cu118
+      - torchvision==0.22.1+cu118
+      - torchaudio==2.7.1+cu118
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - matplotlib
+      - numpy
+      - opencv-python
+      - tqdm
+
