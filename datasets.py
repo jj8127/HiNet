@@ -26,6 +26,12 @@ class Hinet_Dataset(Dataset):
             # test
             self.files = sorted(glob.glob(c.VAL_PATH + "/*." + c.format_val))
 
+        if not self.files:
+            raise FileNotFoundError(
+                f"No image files found for mode '{mode}' in "
+                f"{'TRAIN_PATH' if mode == 'train' else 'VAL_PATH'}"
+            )
+
     def __getitem__(self, index):
         """Return the transformed image at ``index``.
 
@@ -37,14 +43,18 @@ class Hinet_Dataset(Dataset):
         """
 
         while index < len(self.files):
+            path = self.files[index]
             try:
-                image = Image.open(self.files[index])
+                image = Image.open(path)
                 image = to_rgb(image)
                 return self.transform(image)
             except Exception:
                 index += 1
 
-        raise IndexError("No valid image found at or after the given index")
+        raise RuntimeError(
+            f"No valid image found starting from index {index}. Check dataset "
+            f"files for corruption."
+        )
 
     def __len__(self):
         if self.mode == "shuffle":
