@@ -17,42 +17,92 @@ class Hinet_Dataset(Dataset):
 
         self.transform = transforms_
         self.mode = mode
-        if mode == 'train':
+        if mode == "train":
             # train
-            self.files = natsorted(sorted(glob.glob(c.TRAIN_PATH + "/*." + c.format_train)))
+            self.files = natsorted(
+                sorted(glob.glob(c.TRAIN_PATH + "/*." + c.format_train))
+            )
         else:
             # test
             self.files = sorted(glob.glob(c.VAL_PATH + "/*." + c.format_val))
 
-    def __getitem__(self, index):
-        try:
-            image = Image.open(self.files[index])
-            image = to_rgb(image)
-            item = self.transform(image)
-            return item
+        if not self.files:
+            raise FileNotFoundError(
+                f"No image files found for mode '{mode}' in "
+                f"{'TRAIN_PATH' if mode == 'train' else 'VAL_PATH'}"
+            )
 
-        except:
-            return self.__getitem__(index + 1)
+        # Filter out files that cannot be opened. This prevents index errors
+        # when corrupted images are present in the dataset directories.
+        valid_files = []
+        for path in self.files:
+            try:
+                with Image.open(path) as img:
+                    img.verify()
+                valid_files.append(path)
+            except Exception:
+                # Ignore unreadable files
+                continue
+
+        self.files = valid_files
+
+        if not self.files:
+            raise RuntimeError(
+                f"No valid image files found for mode '{mode}'."
+            )
+
+        # Limit the number of training images to reduce resource usage. Any
+        # corrupted images have already been filtered out above.
+        if mode == "train" and getattr(c, "train_limit", None):
+            self.files = self.files[: c.train_limit]
+
+    def __getitem__(self, index):
+        """Return the transformed image at ``index``.
+
+        The original implementation used recursion to skip files that could not
+        be opened. When the end of ``self.files`` was reached, this caused an
+        infinite recursion leading to ``RecursionError``. The new logic iterates
+        forward until a valid image is found and raises ``IndexError`` if none is
+        available.
+        """
+
+        while index < len(self.files):
+            path = self.files[index]
+            try:
+                image = Image.open(path)
+                image = to_rgb(image)
+                return self.transform(image)
+            except Exception:
+                index += 1
+
+        raise RuntimeError(
+            f"No valid image found starting from index {index}. Check dataset "
+            f"files for corruption."
+        )
 
     def __len__(self):
-        if self.mode == 'shuffle':
+        if self.mode == "shuffle":
             return max(len(self.files_cover), len(self.files_secret))
 
         else:
             return len(self.files)
 
 
-transform = T.Compose([
-    T.RandomHorizontalFlip(),
-    T.RandomVerticalFlip(),
-    T.RandomCrop(c.cropsize),
-    T.ToTensor()
-])
+transform = T.Compose(
+    [
+        T.RandomHorizontalFlip(),
+        T.RandomVerticalFlip(),
+        T.RandomCrop(c.cropsize),
+        T.ToTensor(),
+    ]
+)
 
-transform_val = T.Compose([
-    T.CenterCrop(c.cropsize_val),
-    T.ToTensor(),
-])
+transform_val = T.Compose(
+    [
+        T.CenterCrop(c.cropsize_val),
+        T.ToTensor(),
+    ]
+)
 
 
 # Training data loader
@@ -62,7 +112,7 @@ trainloader = DataLoader(
     shuffle=True,
     pin_memory=True,
     num_workers=8,
-    drop_last=True
+    drop_last=True,
 )
 # Test data loader
 testloader = DataLoader(
@@ -71,5 +121,5 @@ testloader = DataLoader(
     shuffle=False,
     pin_memory=True,
     num_workers=1,
-    drop_last=True
+    drop_last=True,
 )
