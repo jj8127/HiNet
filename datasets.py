@@ -32,6 +32,36 @@ class Hinet_Dataset(Dataset):
                 f"{'TRAIN_PATH' if mode == 'train' else 'VAL_PATH'}"
             )
 
+        # Filter out files that cannot be opened. This prevents index errors
+        # when corrupted images are present in the dataset directories.
+        valid_files = []
+        for path in self.files:
+            try:
+                with Image.open(path) as img:
+                    img.verify()
+                valid_files.append(path)
+            except Exception:
+                # Ignore unreadable files
+                continue
+
+        self.files = valid_files
+
+        if not self.files:
+            raise RuntimeError(
+                f"No valid image files found for mode '{mode}'."
+            )
+
+        # Limit the number of training images to reduce resource usage. Any
+        # corrupted images have already been filtered out above.
+        if mode == "train" and getattr(c, "train_limit", None):
+            self.files = self.files[: c.train_limit]
+
+        if not self.files:
+            raise FileNotFoundError(
+                f"No image files found for mode '{mode}' in "
+                f"{'TRAIN_PATH' if mode == 'train' else 'VAL_PATH'}"
+            )
+
     def __getitem__(self, index):
         """Return the transformed image at ``index``.
 
