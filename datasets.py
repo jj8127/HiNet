@@ -56,6 +56,12 @@ class Hinet_Dataset(Dataset):
         if mode == "train" and getattr(c, "train_limit", None):
             self.files = self.files[: c.train_limit]
 
+        if not self.files:
+            raise FileNotFoundError(
+                f"No image files found for mode '{mode}' in "
+                f"{'TRAIN_PATH' if mode == 'train' else 'VAL_PATH'}"
+            )
+
     def __getitem__(self, index):
         """Return the transformed image at ``index``.
 
