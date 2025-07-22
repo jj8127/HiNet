@@ -18,6 +18,7 @@ warnings.filterwarnings("ignore")
 device = torch.device("cpu")
 
 
+
 def gauss_noise(shape):
     noise = torch.zeros(shape, device=device)
     for i in range(noise.shape[0]):

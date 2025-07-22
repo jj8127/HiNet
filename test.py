@@ -13,6 +13,7 @@ import modules.Unet_common as common
 device = torch.device("cpu")
 
 
+
 def load(name):
     state_dicts = torch.load(name)
     network_state_dict = {
@@ -23,6 +24,7 @@ def load(name):
         optim.load_state_dict(state_dicts["opt"])
     except Exception:
         print("Cannot load optimizer for some reason or other")
+
 
 
 def gauss_noise(shape):
@@ -47,6 +49,7 @@ def computePSNR(origin, pred):
 
 net = Model().to(device)
 init_model(net)
+
 params_trainable = list(filter(lambda p: p.requires_grad, net.parameters()))
 optim = torch.optim.Adam(
     params_trainable,

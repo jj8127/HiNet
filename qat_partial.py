@@ -32,6 +32,7 @@ select_qengine()
 device = torch.device("cpu")
 
 
+
 def mark_quant_layers(module):
     """Recursively assign QAT qconfig to convolution layers."""
     for child in module.children():
