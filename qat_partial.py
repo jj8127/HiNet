@@ -8,11 +8,11 @@ import torchvision
 from datetime import datetime
 
 from hinet import Hinet
-from invblock import INV_block
 from rrdb_denselayer import ResidualDenseBlock_out
 import datasets
 import modules.Unet_common as common
 import config as c
+
 
 def select_qengine():
     """Pick a quantization engine supported by the current PyTorch build."""
@@ -25,17 +25,20 @@ def select_qengine():
         torch.backends.quantized.engine = engines[0]
     print(f"using quantization engine: {torch.backends.quantized.engine}")
 
+
 select_qengine()
 
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 
 
 def mark_quant_layers(module):
     """Recursively assign QAT qconfig to convolution layers."""
     for child in module.children():
         if isinstance(child, nn.Conv2d):
-            child.qconfig = tq.get_default_qat_qconfig(torch.backends.quantized.engine)
+            child.qconfig = tq.get_default_qat_qconfig(
+                torch.backends.quantized.engine
+            )
         mark_quant_layers(child)
 
 
@@ -48,7 +51,12 @@ def prepare_model_for_qat(model):
             try:
                 tq.fuse_modules(
                     m,
-                    [["conv1", "lrelu"], ["conv2", "lrelu"], ["conv3", "lrelu"], ["conv4", "lrelu"]],
+                    [
+                        ["conv1", "lrelu"],
+                        ["conv2", "lrelu"],
+                        ["conv3", "lrelu"],
+                        ["conv4", "lrelu"],
+                    ],
                     inplace=True,
                 )
             except AssertionError:
@@ -72,22 +80,22 @@ def load_pretrained(model, path=None):
     state = torch.load(path, map_location=device)
     if isinstance(state, dict):
         # handle checkpoints saved with different wrappers
-        if 'net' in state:
-            state = state['net']
-        elif 'state_dict' in state:
-            state = state['state_dict']
-        elif 'model' in state and isinstance(state['model'], dict):
-            state = state['model']
+        if "net" in state:
+            state = state["net"]
+        elif "state_dict" in state:
+            state = state["state_dict"]
+        elif "model" in state and isinstance(state["model"], dict):
+            state = state["model"]
     # strip common prefixes such as 'module.' or 'model.'
     new_state = {}
     for k, v in state.items():
         name = k
-        if name.startswith('module.model.'):
-            name = name[len('module.model.') :]
-        elif name.startswith('module.'):
-            name = name[len('module.') :]
-        if name.startswith('model.'):
-            name = name[len('model.') :]
+        if name.startswith("module.model."):
+            name = name[len("module.model.") :]
+        elif name.startswith("module."):
+            name = name[len("module.") :]
+        if name.startswith("model."):
+            name = name[len("model.") :]
         new_state[name] = v
     missing, unexpected = model.load_state_dict(new_state, strict=False)
     if missing:
@@ -120,11 +128,17 @@ def train(model, epochs=1):
             output = model(input_img)
             output_steg = output.narrow(1, 0, 4 * c.channels_in)
             steg_img = iwt(output_steg)
-            output_z = output.narrow(1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in)
+            output_z = output.narrow(
+                1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in
+            )
             noise = torch.randn_like(output_z)
             rev_input = torch.cat((output_steg, noise), 1)
             backward = model(rev_input, rev=True)
-            secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in))
+            secret_rev = iwt(
+                backward.narrow(
+                    1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in
+                )
+            )
 
             g_loss = F.mse_loss(steg_img, cover, reduction="sum")
             r_loss = F.mse_loss(secret_rev, secret, reduction="sum")
@@ -167,7 +181,9 @@ def calibrate(model, steps=5):
             input_img = torch.cat((dwt(cover), dwt(secret)), 1)
             if torch.backends.quantized.engine == "qnnpack":
                 input_img = input_img.to(memory_format=torch.channels_last)
-            assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
+            assert (
+                input_img.size(1) == 24
+            ), f"expected 24 channels, got {input_img.size(1)}"
             model(input_img)
 
 
@@ -203,10 +219,20 @@ def evaluate(model, save_samples: bool = False, device=torch.device("cpu")):
                 input_img = input_img.to(memory_format=torch.channels_last)
             output = model(input_img)
             steg = iwt(output.narrow(1, 0, 4 * c.channels_in))
-            z = torch.randn_like(output.narrow(1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in))
-            rev_input = torch.cat((output.narrow(1, 0, 4 * c.channels_in), z), 1)
+            z = torch.randn_like(
+                output.narrow(
+                    1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in
+                )
+            )
+            rev_input = torch.cat(
+                (output.narrow(1, 0, 4 * c.channels_in), z), 1
+            )
             backward = model(rev_input, rev=True)
-            secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in))
+            secret_rev = iwt(
+                backward.narrow(
+                    1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in
+                )
+            )
             scores_cover.append(psnr(steg, cover))
             scores_secret.append(psnr(secret_rev, secret))
             if save_samples and not saved:
@@ -214,10 +240,20 @@ def evaluate(model, save_samples: bool = False, device=torch.device("cpu")):
                 os.makedirs(c.IMAGE_PATH_secret, exist_ok=True)
                 os.makedirs(c.IMAGE_PATH_steg, exist_ok=True)
                 os.makedirs(c.IMAGE_PATH_secret_rev, exist_ok=True)
-                torchvision.utils.save_image(cover, os.path.join(c.IMAGE_PATH_cover, f"{idx:05d}.png"))
-                torchvision.utils.save_image(secret, os.path.join(c.IMAGE_PATH_secret, f"{idx:05d}.png"))
-                torchvision.utils.save_image(steg.clamp(0, 1), os.path.join(c.IMAGE_PATH_steg, f"{idx:05d}.png"))
-                torchvision.utils.save_image(secret_rev.clamp(0, 1), os.path.join(c.IMAGE_PATH_secret_rev, f"{idx:05d}.png"))
+                torchvision.utils.save_image(
+                    cover, os.path.join(c.IMAGE_PATH_cover, f"{idx:05d}.png")
+                )
+                torchvision.utils.save_image(
+                    secret, os.path.join(c.IMAGE_PATH_secret, f"{idx:05d}.png")
+                )
+                torchvision.utils.save_image(
+                    steg.clamp(0, 1),
+                    os.path.join(c.IMAGE_PATH_steg, f"{idx:05d}.png"),
+                )
+                torchvision.utils.save_image(
+                    secret_rev.clamp(0, 1),
+                    os.path.join(c.IMAGE_PATH_secret_rev, f"{idx:05d}.png"),
+                )
                 saved = True
     mean_cover = float(np.mean(scores_cover))
     mean_secret = float(np.mean(scores_secret))
@@ -243,10 +279,22 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Run partial INT8 QAT")
-    parser.add_argument("--pretrained", type=str, default=None, help="path to FP32 model")
-    parser.add_argument("--epochs", type=int, default=1, help="number of QAT training epochs")
-    parser.add_argument("--calib-steps", type=int, default=5, help="number of calibration batches")
+    parser.add_argument(
+        "--pretrained", type=str, default=None, help="path to FP32 model"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=1, help="number of QAT training epochs"
+    )
+    parser.add_argument(
+        "--calib-steps",
+        type=int,
+        default=5,
+        help="number of calibration batches",
+    )
     args = parser.parse_args()
 
-    main(pretrained=args.pretrained, epochs=args.epochs, calib_steps=args.calib_steps)
-
+    main(
+        pretrained=args.pretrained,
+        epochs=args.epochs,
+        calib_steps=args.calib_steps,
+    )
