@@ -4,17 +4,14 @@ import torch.nn
 import torch.optim
 import torchvision
 import numpy as np
-from model import *
+from model import Model, init_model
 import config as c
 import datasets
 import modules.Unet_common as common
 
 
-if not torch.cuda.is_available():
-    raise RuntimeError(
-        "CUDA device is required for training but not available"
-    )
-device = torch.device("cuda:0")
+device = torch.device("cpu")
+
 
 
 def load(name):
@@ -25,15 +22,16 @@ def load(name):
     net.load_state_dict(network_state_dict)
     try:
         optim.load_state_dict(state_dicts["opt"])
-    except:
+    except Exception:
         print("Cannot load optimizer for some reason or other")
+
 
 
 def gauss_noise(shape):
 
-    noise = torch.zeros(shape).cuda()
+    noise = torch.zeros(shape, device=device)
     for i in range(noise.shape[0]):
-        noise[i] = torch.randn(noise[i].shape).cuda()
+        noise[i] = torch.randn(noise[i].shape, device=device)
 
     return noise
 
@@ -49,10 +47,9 @@ def computePSNR(origin, pred):
     return 10 * math.log10(255.0**2 / mse)
 
 
-net = Model()
-net.cuda()
+net = Model().to(device)
 init_model(net)
-net = torch.nn.DataParallel(net, device_ids=c.device_ids)
+
 params_trainable = list(filter(lambda p: p.requires_grad, net.parameters()))
 optim = torch.optim.Adam(
     params_trainable,

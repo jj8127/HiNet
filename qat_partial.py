@@ -8,7 +8,6 @@ import torchvision
 from datetime import datetime
 
 from hinet import Hinet
-from invblock import INV_block
 from rrdb_denselayer import ResidualDenseBlock_out
 import datasets
 import modules.Unet_common as common
@@ -30,11 +29,8 @@ def select_qengine():
 select_qengine()
 
 
-if not torch.cuda.is_available():
-    raise RuntimeError(
-        "CUDA device is required for training but not available"
-    )
-device = torch.device("cuda")
+device = torch.device("cpu")
+
 
 
 def mark_quant_layers(module):

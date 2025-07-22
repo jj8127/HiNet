@@ -25,6 +25,6 @@ def init_model(mod):
     for key, param in mod.named_parameters():
         split = key.split('.')
         if param.requires_grad:
-            param.data = c.init_scale * torch.randn(param.data.shape).cuda()
+            param.data = c.init_scale * torch.randn(param.data.shape)
             if split[-2] == 'conv5':
                 param.data.fill_(0.)

@@ -4,7 +4,7 @@ import torch.nn
 import torch.optim
 import math
 import numpy as np
-from model import *
+from model import Model, init_model
 import config as c
 from tensorboardX import SummaryWriter
 import datasets
@@ -15,17 +15,14 @@ import logging
 import util
 
 warnings.filterwarnings("ignore")
-if not torch.cuda.is_available():
-    raise RuntimeError(
-        "CUDA device is required for training but not available"
-    )
-device = torch.device("cuda:0")
+device = torch.device("cpu")
+
 
 
 def gauss_noise(shape):
-    noise = torch.zeros(shape).cuda()
+    noise = torch.zeros(shape, device=device)
     for i in range(noise.shape[0]):
-        noise[i] = torch.randn(noise[i].shape).cuda()
+        noise[i] = torch.randn(noise[i].shape, device=device)
 
     return noise
 
@@ -74,17 +71,15 @@ def load(name):
     net.load_state_dict(network_state_dict)
     try:
         optim.load_state_dict(state_dicts["opt"])
-    except:
+    except Exception:
         print("Cannot load optimizer for some reason or other")
 
 
 #####################
 # Model initialize: #
 #####################
-net = Model()
-net.cuda()
+net = Model().to(device)
 init_model(net)
-net = torch.nn.DataParallel(net, device_ids=c.device_ids)
 para = get_parameter_number(net)
 print(para)
 params_trainable = list(filter(lambda p: p.requires_grad, net.parameters()))
@@ -174,7 +169,7 @@ try:
             #################
             #     loss:     #
             #################
-            g_loss = guide_loss(steg_img.cuda(), cover.cuda())
+            g_loss = guide_loss(steg_img.to(device), cover.to(device))
             r_loss = reconstruction_loss(secret_rev, secret)
             steg_low = output_steg.narrow(1, 0, c.channels_in)
             cover_low = cover_input.narrow(1, 0, c.channels_in)
@@ -234,7 +229,7 @@ try:
                     #################
                     #   backward:   #
                     #################
-                    output_steg = output_steg.cuda()
+                    output_steg = output_steg.to(device)
                     output_rev = torch.cat((output_steg, output_z), 1)
                     output_image = net(output_rev, rev=True)
                     secret_rev = output_image.narrow(
@@ -293,7 +288,7 @@ try:
     )
     writer.close()
 
-except:
+except Exception:
     if c.checkpoint_on_error:
         torch.save(
             {"opt": optim.state_dict(), "net": net.state_dict()},
