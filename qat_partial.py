@@ -4,7 +4,6 @@ import torch.ao.quantization as tq
 import torch.nn.functional as F
 import numpy as np
 import os
-from datetime import datetime
 import matplotlib.pyplot as plt
 
 from hinet import Hinet
@@ -14,9 +13,7 @@ import datasets
 import modules.Unet_common as common
 import config as c
 
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 def mark_quant_layers(module):
     for child in module.children():
@@ -24,16 +21,12 @@ def mark_quant_layers(module):
             continue
         if isinstance(child, nn.Conv2d):
             child.qconfig = tq.get_default_qat_qconfig("fbgemm")
-
         mark_quant_layers(child)
-
 
 def prepare_model_for_qat(model):
     model.train()
     mark_quant_layers(model)
-
     tq.prepare_qat(model, inplace=True)
-
 
 def load_pretrained(model, path=None):
     """Load FP32 weights before QAT."""
@@ -51,7 +44,6 @@ def load_pretrained(model, path=None):
             state = state['state_dict']
         elif 'model' in state and isinstance(state['model'], dict):
             state = state['model']
-
     # strip common prefixes such as 'module.' or 'model.'
     new_state = {}
     for k, v in state.items():
@@ -62,7 +54,6 @@ def load_pretrained(model, path=None):
             name = name[len('module.') :]
         if name.startswith('model.'):
             name = name[len('model.') :]
-
         new_state[name] = v
     missing, unexpected = model.load_state_dict(new_state, strict=False)
     if missing:
@@ -70,7 +61,6 @@ def load_pretrained(model, path=None):
     if unexpected:
         print(f"warning: unexpected keys {unexpected}")
     print(f"loaded pretrained weights from {path}")
-
 
 def train(model, epochs=1, metrics=None):
     """Train the network with partial QAT for several epochs.
@@ -95,7 +85,6 @@ def train(model, epochs=1, metrics=None):
             cover_in = dwt(cover)
             secret_in = dwt(secret)
             input_img = torch.cat((cover_in, secret_in), 1)
-
 
             output = model(input_img)
             output_steg = output.narrow(1, 0, 4 * c.channels_in)
@@ -131,7 +120,6 @@ def train(model, epochs=1, metrics=None):
             metrics.setdefault("psnr_train_cover", []).append(ps_cover)
             metrics.setdefault("psnr_train_secret", []).append(ps_secret)
 
-
 def calibrate(model, steps=5, metrics=None):
     """Run a short calibration on a few training batches.
 
@@ -156,7 +144,6 @@ def calibrate(model, steps=5, metrics=None):
             secret = data[:half]
             input_img = torch.cat((dwt(cover), dwt(secret)), 1)
             assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
-
             model(input_img)
             if metrics is not None:
                 ps_cover, ps_secret = evaluate(model, silent=True)
@@ -167,13 +154,11 @@ def convert(model):
     model.cpu()
     return tq.convert(model.eval(), inplace=False)
 
-
 def psnr(img1, img2):
     mse = torch.mean((img1 - img2) ** 2)
     if mse == 0:
         return float("inf")
     return 10 * torch.log10(1.0 / mse).item()
-
 
 def evaluate(model, silent=False):
     dwt = common.DWT().to(device)
@@ -219,10 +204,9 @@ def evaluate(model, silent=False):
         print(f"PSNR cover: {mean_cover:.2f} dB, secret: {mean_secret:.2f} dB")
     return mean_cover, mean_secret
 
-
-def plot_metrics(metrics, timestamp):
+def plot_metrics(metrics, label):
     os.makedirs("logging", exist_ok=True)
-    np.savez(os.path.join("logging", f"qat_metrics_{timestamp}.npz"), **metrics)
+    np.savez(os.path.join("logging", f"qat_metrics_{label}.npz"), **metrics)
 
     if metrics.get("loss"):
         plt.figure()
@@ -231,7 +215,7 @@ def plot_metrics(metrics, timestamp):
         plt.ylabel("Loss")
         plt.title("Training Loss")
         plt.grid(True)
-        plt.savefig(os.path.join("logging", f"loss_{timestamp}.png"))
+        plt.savefig(os.path.join("logging", f"loss_{label}.png"))
         plt.close()
 
     if metrics.get("psnr_train_cover"):
@@ -244,7 +228,7 @@ def plot_metrics(metrics, timestamp):
         plt.title("Training PSNR")
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join("logging", f"psnr_train_{timestamp}.png"))
+        plt.savefig(os.path.join("logging", f"psnr_train_{label}.png"))
         plt.close()
 
     if metrics.get("psnr_calib_cover"):
@@ -257,9 +241,8 @@ def plot_metrics(metrics, timestamp):
         plt.title("Calibration PSNR")
         plt.legend()
         plt.grid(True)
-        plt.savefig(os.path.join("logging", f"psnr_calib_{timestamp}.png"))
+        plt.savefig(os.path.join("logging", f"psnr_calib_{label}.png"))
         plt.close()
-
 
 def main(pretrained=None, epochs=1, calib_steps=5):
     metrics = {}
@@ -271,19 +254,19 @@ def main(pretrained=None, epochs=1, calib_steps=5):
     qmodel = convert(model)
     evaluate(qmodel.to(device))
     os.makedirs("model", exist_ok=True)
-    save_path = os.path.join("model", f"model_qat_ep{epochs}_calib{calib_steps}.pt")
+    label = f"ep{epochs}_calib{calib_steps}"
+    save_path = os.path.join("model", f"model_qat_{label}.pt")
     torch.save(qmodel.state_dict(), save_path)
     print(f"quantized model saved to {save_path}")
-    plot_metrics(metrics, timestamp)
-
+    plot_metrics(metrics, label)
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Run partial INT8 QAT")
     parser.add_argument("--pretrained", type=str, default=None, help="path to FP32 model")
-    parser.add_argument("--epochs", type=int, default=1, help="number of QAT training epochs")
-    parser.add_argument("--calib-steps", type=int, default=5, help="number of calibration batches")
+    parser.add_argument("--epochs", type=int, default=50, help="number of QAT training epochs")
+    parser.add_argument("--calib-steps", type=int, default=20, help="number of calibration batches")
     args = parser.parse_args()
 
     main(pretrained=args.pretrained, epochs=args.epochs, calib_steps=args.calib_steps)
