@@ -159,11 +159,26 @@ def evaluate(model):
     model.eval()
     scores_cover = []
     scores_secret = []
+
+    def pair_batches(loader):
+        """Yield image pairs regardless of original batch size."""
+        buffer = []
+        for batch in loader:
+            if batch.ndim == 3:
+                batch = batch.unsqueeze(0)
+            for img in batch:
+                buffer.append(img)
+                if len(buffer) == 2:
+                    yield torch.stack(buffer, 0)
+                    buffer = []
+        if buffer:
+            print("Warning: ignoring the last image without a pair")
+
     with torch.no_grad():
-        for data in datasets.testloader:
-            data = data.to(device)
-            cover = data[data.size(0) // 2 :]
-            secret = data[: data.size(0) // 2]
+        for batch in pair_batches(datasets.testloader):
+            batch = batch.to(device)
+            cover = batch[1:]
+            secret = batch[:1]
             cover_in = dwt(cover)
             secret_in = dwt(secret)
             input_img = torch.cat((cover_in, secret_in), 1)
