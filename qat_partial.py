@@ -258,7 +258,7 @@ def setup_logger(label):
         root.removeHandler(h)
 
     fmt = "%(asctime)s - %(levelname)s: %(message)s"
-    datefmt = "%y-%m-%d %H:%M:%S.%f"
+    datefmt = "%y-%m-%d %H:%M:%S"
 
     logging.basicConfig(
         level=logging.INFO,
