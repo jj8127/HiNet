@@ -55,7 +55,7 @@ conda activate hinet_pytorch2
 set `MODEL_PATH = '/home/usrname/Hinet/model/'` and file name `suffix = 'model.pt'`.
 
 ## Partial INT8 Quantization
-The script `qat_partial.py` demonstrates how to apply mixed precision
+The script `qat_8bit.py` demonstrates how to apply mixed precision
 quantization aware training (QAT). All `nn.Conv2d` layers are quantized while
 the `INV_block` modules remain in full precision. The training loop reuses the
 same guide/reconstruction/low-frequency losses from `train.py` so the
@@ -68,7 +68,7 @@ image-hiding process for a number of epochs before calibration.
 Run the example:
 
 ```bash
-python qat_partial.py --pretrained /path/to/model.pt \
+python qat_8bit.py --pretrained /path/to/model.pt \
                      --epochs 5 --calib-steps 10
 ```
 
@@ -76,6 +76,20 @@ After conversion, run the demo script to save sample stego and recovered images:
 
 ```bash
 python demo_quantized.py --model model/model_qat_YYYYMMDD-HHMMSS.pt
+```
+
+## Partial 4-bit Quantization
+The `qat_4bit.py` script performs QAT using 4-bit fake quantization. The overall
+procedure is the same as in `qat_8bit.py` but each convolution weight and
+activation is quantized to 4 bits while `INV_block` modules remain in full
+precision. After training and calibration the quantized weights are saved as
+`model/model_qat4bit_epEPOCHS_calibSTEPS.pt`.
+
+Example usage:
+
+```bash
+python qat_4bit.py --pretrained /path/to/model.pt \
+                   --epochs 5 --calib-steps 10
 ```
 
 
