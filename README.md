@@ -78,6 +78,20 @@ After conversion, run the demo script to save sample stego and recovered images:
 python demo_quantized.py --model model/model_qat_YYYYMMDD-HHMMSS.pt
 ```
 
+## Partial 4-bit Quantization
+The `qat_4bit.py` script performs QAT using 4-bit fake quantization. The overall
+procedure is the same as in `qat_partial.py` but each convolution weight and
+activation is quantized to 4 bits while `INV_block` modules remain in full
+precision. After training and calibration the quantized weights are saved as
+`model/model_qat4bit_epEPOCHS_calibSTEPS.pt`.
+
+Example usage:
+
+```bash
+python qat_4bit.py --pretrained /path/to/model.pt \
+                   --epochs 5 --calib-steps 10
+```
+
 
 ## Training Demo (2021/12/25 Updated)
 - Here we provide a training demo to show how to train a converged model in the early training stage. During this process, the model may suffer from explosion. Our solution is to stop the training process at a normal node and abate the learning rate. Then, continue to train the model.
