@@ -12,21 +12,8 @@ import modules.Unet_common as common
 import datasets
 import config as c
 
-def select_qengine():
-    engines = torch.backends.quantized.supported_engines
-    if "fbgemm" in engines:
-        torch.backends.quantized.engine = "fbgemm"
-    elif "qnnpack" in engines:
-        torch.backends.quantized.engine = "qnnpack"
-    elif engines:
-        torch.backends.quantized.engine = engines[0]
-    print(f"using quantization engine: {torch.backends.quantized.engine}")
 
-select_qengine()
-
-
-# quantized ops run on CPU
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def mark_quant_layers(module):
