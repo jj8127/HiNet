@@ -8,6 +8,7 @@ from datetime import datetime
 
 from hinet import Hinet
 from invblock import INV_block
+
 import datasets
 import modules.Unet_common as common
 import config as c
@@ -22,12 +23,14 @@ def mark_quant_layers(module):
             continue
         if isinstance(child, nn.Conv2d):
             child.qconfig = tq.get_default_qat_qconfig("fbgemm")
+
         mark_quant_layers(child)
 
 
 def prepare_model_for_qat(model):
     model.train()
     mark_quant_layers(model)
+
     tq.prepare_qat(model, inplace=True)
 
 
@@ -47,6 +50,7 @@ def load_pretrained(model, path=None):
             state = state['state_dict']
         elif 'model' in state and isinstance(state['model'], dict):
             state = state['model']
+
     # strip common prefixes such as 'module.' or 'model.'
     new_state = {}
     for k, v in state.items():
@@ -57,6 +61,7 @@ def load_pretrained(model, path=None):
             name = name[len('module.') :]
         if name.startswith('model.'):
             name = name[len('model.') :]
+
         new_state[name] = v
     missing, unexpected = model.load_state_dict(new_state, strict=False)
     if missing:
@@ -83,6 +88,7 @@ def train(model, epochs=1):
             cover_in = dwt(cover)
             secret_in = dwt(secret)
             input_img = torch.cat((cover_in, secret_in), 1)
+
 
             output = model(input_img)
             output_steg = output.narrow(1, 0, 4 * c.channels_in)
@@ -132,8 +138,8 @@ def calibrate(model, steps=5):
             secret = data[:half]
             input_img = torch.cat((dwt(cover), dwt(secret)), 1)
             assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
-            model(input_img)
 
+            model(input_img)
 
 def convert(model):
     model.cpu()
@@ -169,6 +175,7 @@ def evaluate(model):
             secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in))
             scores_cover.append(psnr(steg, cover))
             scores_secret.append(psnr(secret_rev, secret))
+
     mean_cover = float(np.mean(scores_cover))
     mean_secret = float(np.mean(scores_secret))
     print(f"PSNR cover: {mean_cover:.2f} dB, secret: {mean_secret:.2f} dB")
@@ -199,4 +206,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(pretrained=args.pretrained, epochs=args.epochs, calib_steps=args.calib_steps)
-

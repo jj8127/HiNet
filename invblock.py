@@ -1,6 +1,7 @@
 from math import exp
 import torch
 import torch.nn as nn
+import torch.ao.quantization as tq
 import config as c
 from rrdb_denselayer import ResidualDenseBlock_out
 
@@ -19,6 +20,12 @@ class INV_block(nn.Module):
         # φ
         self.f = subnet_constructor(self.split_len2, self.split_len1)
 
+        # quantization stubs to keep the path through f and g quantized
+        self.quant_f = tq.QuantStub()
+        self.dequant_f = tq.DeQuantStub()
+        self.quant_g = tq.QuantStub()
+        self.dequant_g = tq.DeQuantStub()
+
     def e(self, s):
         return torch.exp(self.clamp * 2 * (torch.sigmoid(s) - 0.5))
 
@@ -27,17 +34,19 @@ class INV_block(nn.Module):
                   x.narrow(1, self.split_len1, self.split_len2))
 
         if not rev:
-
-            t2 = self.f(x2)
+            x2_q = self.quant_f(x2)
+            t2 = self.f(x2_q)
+            t2 = self.dequant_f(t2)
             y1 = x1 + t2
             s1, t1 = self.r(y1), self.y(y1)
             y2 = self.e(s1) * x2 + t1
 
         else:
-
             s1, t1 = self.r(x1), self.y(x1)
             y2 = (x2 - t1) / self.e(s1)
-            t2 = self.f(y2)
+            y2_q = self.quant_g(y2)
+            t2 = self.f(y2_q)
+            t2 = self.dequant_g(t2)
             y1 = (x1 - t2)
 
         return torch.cat((y1, y2), 1)

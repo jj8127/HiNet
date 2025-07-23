@@ -66,5 +66,3 @@ class Hinet(nn.Module):
             out = self.inv1(out, rev=True)
 
         return out
-
-
