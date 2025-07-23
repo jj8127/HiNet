@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.ao.quantization as tq
 import logging
-from datetime import datetime
 
 from hinet import Hinet
 from invblock import INV_block
@@ -21,8 +20,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def mark_quant_layers(module):
     for child in module.children():
         if isinstance(child, INV_block):
-            # INV_block 내부는 양자화 제외
-            continue
+            continue  # INV_block은 FP32 유지
         if isinstance(child, nn.Conv2d):
             child.qconfig = tq.get_default_qat_qconfig("fbgemm")
         mark_quant_layers(child)
@@ -41,7 +39,6 @@ def convert(model):
 
 # ---------------------------- Load FP32 weights -----------------------------
 def load_pretrained(model, path=None):
-    """Load FP32 weights before QAT."""
     if path is None:
         path = os.path.join(c.MODEL_PATH, c.suffix)
     if not os.path.isfile(path):
@@ -107,15 +104,19 @@ def evaluate(model, silent=False):
             batch = batch.to(device)
             cover = batch[1:]
             secret = batch[:1]
+
             cover_in = dwt(cover)
             secret_in = dwt(secret)
             input_img = torch.cat((cover_in, secret_in), 1)
+
             output = model(input_img)
             steg = iwt(output.narrow(1, 0, 4 * c.channels_in))
+
             z = torch.randn_like(output.narrow(1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in))
             rev_input = torch.cat((output.narrow(1, 0, 4 * c.channels_in), z), 1)
             backward = model(rev_input, rev=True)
             secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in))
+
             scores_cover.append(psnr(steg, cover))
             scores_secret.append(psnr(secret_rev, secret))
 
@@ -135,6 +136,7 @@ def train(model, epochs=1, metrics=None):
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
+
         for data in datasets.trainloader:
             data = data.to(device)
             half = data.size(0) // 2
@@ -147,6 +149,7 @@ def train(model, epochs=1, metrics=None):
             output = model(input_img)
             output_steg = output.narrow(1, 0, 4 * c.channels_in)
             steg_img = iwt(output_steg)
+
             output_z = output.narrow(1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in)
             noise = torch.randn_like(output_z)
             rev_input = torch.cat((output_steg, noise), 1)
@@ -196,6 +199,7 @@ def calibrate(model, steps=5, metrics=None):
             data = data.to(device)
             half = data.size(0) // 2
             cover, secret = data[half:], data[:half]
+
             input_img = torch.cat((dwt(cover), dwt(secret)), 1)
             assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
             model(input_img)
@@ -204,16 +208,16 @@ def calibrate(model, steps=5, metrics=None):
                 ps_cover, ps_secret = evaluate(model, silent=True)
                 metrics["psnr_calib_cover"].append(ps_cover)
                 metrics["psnr_calib_secret"].append(ps_secret)
+
             logging.info(f"Calibration step {step}/{steps} done.")
 
 
 # ---------------------------- Plot / Logging -------------------------------
 def plot_metrics(metrics, label):
     os.makedirs("logging", exist_ok=True)
-    # 저장
     np.savez(os.path.join("logging", f"qat_metrics_{label}.npz"), **metrics)
 
-    # 한 장짜리 stage1 스타일 그림
+    # 1장짜리 그림
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     # PSNR_C
@@ -238,19 +242,28 @@ def plot_metrics(metrics, label):
     axes[2].grid(True)
 
     fig.tight_layout()
-    save_png = os.path.join("logging", f"stage1_{label}.png")
-    fig.savefig(save_png)
+    png_path = os.path.join("logging", f"stage1_{label}.png")
+    fig.savefig(png_path)
     plt.close(fig)
-    logging.info(f"saved plots to {save_png}")
+    logging.info(f"saved plots to {png_path}")
 
 
 def setup_logger(label):
     os.makedirs("logging", exist_ok=True)
     log_path = os.path.join("logging", f"train__{label}.log")
-    fmt = "%y-%m-%d %H:%M:%S.%f - %(levelname)s: %(message)s"
+
+    # 기존 핸들러 제거(중복 방지)
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+
+    fmt = "%(asctime)s - %(levelname)s: %(message)s"
+    datefmt = "%y-%m-%d %H:%M:%S.%f"
+
     logging.basicConfig(
         level=logging.INFO,
         format=fmt,
+        datefmt=datefmt,
         handlers=[
             logging.FileHandler(log_path, mode="w"),
             logging.StreamHandler()
