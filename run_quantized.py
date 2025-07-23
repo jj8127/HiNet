@@ -37,6 +37,20 @@ def load_quantized(model_path: str) -> nn.Module:
     return model
 
 
+def pair_batches(loader):
+    buffer = []
+    for batch in loader:
+        if batch.ndim == 3:
+            batch = batch.unsqueeze(0)
+        for img in batch:
+            buffer.append(img)
+            if len(buffer) == 2:
+                yield torch.stack(buffer, 0)
+                buffer = []
+    if buffer:
+        print("Warning: ignoring the last image without a pair")
+
+
 def gauss_noise(shape):
     return torch.randn(shape, device=device)
 
@@ -44,11 +58,12 @@ def gauss_noise(shape):
 def run(model: nn.Module):
     dwt = common.DWT().to(device)
     iwt = common.IWT().to(device)
+    loader = pair_batches(datasets.testloader)
     with torch.no_grad():
-        for i, data in enumerate(datasets.testloader):
-            data = data.to(device)
-            cover = data[data.shape[0] // 2 :]
-            secret = data[: data.shape[0] // 2]
+        for i, batch in enumerate(loader):
+            batch = batch.to(device)
+            cover = batch[1:]
+            secret = batch[:1]
             cover_in = dwt(cover)
             secret_in = dwt(secret)
             input_img = torch.cat((cover_in, secret_in), 1)
@@ -60,12 +75,10 @@ def run(model: nn.Module):
             rev_input = torch.cat((output_steg, backward_z), 1)
             backward = model(rev_input, rev=True)
             secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.shape[1] - 4 * c.channels_in))
-
             vutils.save_image(cover, os.path.join(c.IMAGE_PATH_cover, f"{i:05d}.png"))
             vutils.save_image(secret, os.path.join(c.IMAGE_PATH_secret, f"{i:05d}.png"))
             vutils.save_image(steg_img, os.path.join(c.IMAGE_PATH_steg, f"{i:05d}.png"))
             vutils.save_image(secret_rev, os.path.join(c.IMAGE_PATH_secret_rev, f"{i:05d}.png"))
-
 
 def main(model_path: str):
     model = load_quantized(model_path)
