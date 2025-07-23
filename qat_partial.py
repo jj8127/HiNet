@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import os
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 from hinet import Hinet
 from invblock import INV_block
@@ -71,8 +72,14 @@ def load_pretrained(model, path=None):
     print(f"loaded pretrained weights from {path}")
 
 
-def train(model, epochs=1):
-    """Train the network with partial QAT for several epochs."""
+def train(model, epochs=1, metrics=None):
+    """Train the network with partial QAT for several epochs.
+
+    Args:
+        model: network to train.
+        epochs: number of epochs.
+        metrics: optional dict to store loss and PSNR per epoch.
+    """
     optim = torch.optim.Adam(model.parameters(), lr=c.lr)
     dwt = common.DWT().to(device)
     iwt = common.IWT().to(device)
@@ -118,10 +125,21 @@ def train(model, epochs=1):
 
         avg = epoch_loss / max(1, len(datasets.trainloader))
         print(f"epoch {epoch + 1}: loss {avg:.6f}")
+        if metrics is not None:
+            metrics.setdefault("loss", []).append(avg)
+            ps_cover, ps_secret = evaluate(model, silent=True)
+            metrics.setdefault("psnr_train_cover", []).append(ps_cover)
+            metrics.setdefault("psnr_train_secret", []).append(ps_secret)
 
 
-def calibrate(model, steps=5):
-    """Run a short calibration on a few training batches."""
+def calibrate(model, steps=5, metrics=None):
+    """Run a short calibration on a few training batches.
+
+    Args:
+        model: model to calibrate.
+        steps: number of calibration batches.
+        metrics: optional dict to record PSNR after each step.
+    """
     model.eval()
     dwt = common.DWT().to(device)
     loader = iter(datasets.trainloader)
@@ -140,6 +158,10 @@ def calibrate(model, steps=5):
             assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
 
             model(input_img)
+            if metrics is not None:
+                ps_cover, ps_secret = evaluate(model, silent=True)
+                metrics.setdefault("psnr_calib_cover", []).append(ps_cover)
+                metrics.setdefault("psnr_calib_secret", []).append(ps_secret)
 
 def convert(model):
     model.cpu()
@@ -153,7 +175,7 @@ def psnr(img1, img2):
     return 10 * torch.log10(1.0 / mse).item()
 
 
-def evaluate(model):
+def evaluate(model, silent=False):
     dwt = common.DWT().to(device)
     iwt = common.IWT().to(device)
     model.eval()
@@ -193,15 +215,59 @@ def evaluate(model):
 
     mean_cover = float(np.mean(scores_cover))
     mean_secret = float(np.mean(scores_secret))
-    print(f"PSNR cover: {mean_cover:.2f} dB, secret: {mean_secret:.2f} dB")
+    if not silent:
+        print(f"PSNR cover: {mean_cover:.2f} dB, secret: {mean_secret:.2f} dB")
+    return mean_cover, mean_secret
+
+
+def plot_metrics(metrics, timestamp):
+    os.makedirs("logging", exist_ok=True)
+    np.savez(os.path.join("logging", f"qat_metrics_{timestamp}.npz"), **metrics)
+
+    if metrics.get("loss"):
+        plt.figure()
+        plt.plot(range(1, len(metrics["loss"]) + 1), metrics["loss"], label="loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training Loss")
+        plt.grid(True)
+        plt.savefig(os.path.join("logging", f"loss_{timestamp}.png"))
+        plt.close()
+
+    if metrics.get("psnr_train_cover"):
+        plt.figure()
+        epochs = range(1, len(metrics["psnr_train_cover"]) + 1)
+        plt.plot(epochs, metrics["psnr_train_cover"], label="cover")
+        plt.plot(epochs, metrics["psnr_train_secret"], label="secret")
+        plt.xlabel("Epoch")
+        plt.ylabel("PSNR (dB)")
+        plt.title("Training PSNR")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join("logging", f"psnr_train_{timestamp}.png"))
+        plt.close()
+
+    if metrics.get("psnr_calib_cover"):
+        plt.figure()
+        steps = range(1, len(metrics["psnr_calib_cover"]) + 1)
+        plt.plot(steps, metrics["psnr_calib_cover"], label="cover")
+        plt.plot(steps, metrics["psnr_calib_secret"], label="secret")
+        plt.xlabel("Calibration step")
+        plt.ylabel("PSNR (dB)")
+        plt.title("Calibration PSNR")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join("logging", f"psnr_calib_{timestamp}.png"))
+        plt.close()
 
 
 def main(pretrained=None, epochs=1, calib_steps=5):
+    metrics = {}
     model = Hinet().to(device)
     load_pretrained(model, pretrained)
     prepare_model_for_qat(model)
-    train(model, epochs=epochs)
-    calibrate(model, steps=calib_steps)
+    train(model, epochs=epochs, metrics=metrics)
+    calibrate(model, steps=calib_steps, metrics=metrics)
     qmodel = convert(model)
     evaluate(qmodel.to(device))
     os.makedirs("model", exist_ok=True)
@@ -209,6 +275,7 @@ def main(pretrained=None, epochs=1, calib_steps=5):
     save_path = os.path.join("model", f"model_qat_{timestamp}.pt")
     torch.save(qmodel.state_dict(), save_path)
     print(f"quantized model saved to {save_path}")
+    plot_metrics(metrics, timestamp)
 
 
 if __name__ == "__main__":
