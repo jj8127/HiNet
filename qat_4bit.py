@@ -14,7 +14,8 @@ import modules.Unet_common as common
 import datasets
 import config as c
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 # ---------------------------- Quantization utils ----------------------------
@@ -321,8 +322,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run partial 4-bit QAT")
     parser.add_argument("--pretrained", type=str, default=None, help="path to FP32 model")
-    parser.add_argument("--epochs", type=int, default=30, help="number of QAT training epochs")
-    parser.add_argument("--calib-steps", type=int, default=20, help="number of calibration batches")
+    parser.add_argument("--epochs", type=int, default=50, help="number of QAT training epochs")
+    parser.add_argument("--calib-steps", type=int, default=10, help="number of calibration batches")
     args = parser.parse_args()
 
     main(pretrained=args.pretrained, epochs=args.epochs, calib_steps=args.calib_steps)

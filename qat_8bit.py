@@ -13,8 +13,8 @@ import modules.Unet_common as common
 import datasets
 import config as c
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device(f"cuda:2" if torch.cuda.is_available() else "cpu")
 
 # ---------------------------- Quantization utils ----------------------------
 def mark_quant_layers(module):
@@ -242,7 +242,7 @@ def plot_metrics(metrics, label):
     axes[2].grid(True)
 
     fig.tight_layout()
-    png_path = os.path.join("logging", f"stage1_{label}.png")
+    png_path = os.path.join("logging", f"stage1_8bit_{label}.png")
     fig.savefig(png_path)
     plt.close(fig)
     logging.info(f"saved plots to {png_path}")
@@ -250,7 +250,7 @@ def plot_metrics(metrics, label):
 
 def setup_logger(label):
     os.makedirs("logging", exist_ok=True)
-    log_path = os.path.join("logging", f"train__{label}.log")
+    log_path = os.path.join("logging", f"train__8bit_{label}.log")
 
     # 기존 핸들러 제거(중복 방지)
     root = logging.getLogger()
@@ -312,8 +312,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run partial INT8 QAT")
     parser.add_argument("--pretrained", type=str, default=None, help="path to FP32 model")
-    parser.add_argument("--epochs", type=int, default=30, help="number of QAT training epochs")
-    parser.add_argument("--calib-steps", type=int, default=20, help="number of calibration batches")
+    parser.add_argument("--epochs", type=int, default=50, help="number of QAT training epochs")
+    parser.add_argument("--calib-steps", type=int, default=10, help="number of calibration batches")
     args = parser.parse_args()
 
     main(pretrained=args.pretrained, epochs=args.epochs, calib_steps=args.calib_steps)
