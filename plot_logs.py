@@ -2,84 +2,54 @@ import re
 import os
 import glob
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logging')
 
-
-def parse_log(path: str) -> list[dict]:
-    records = []
-    bits = 4 if '4bit' in os.path.basename(path) else 8
-    calib_match = re.search(r'calib(\d+)', os.path.basename(path))
-    calibration = int(calib_match.group(1)) if calib_match else None
-    current_epoch = None
+def parse_log(path: str) -> dict:
+    base = os.path.basename(path)
+    # 간단한 라벨: epXX_cYY (XX=epoch, YY=calib step)
+    epoch = re.search(r'ep(\d+)', base)
+    calib = re.search(r'calib(\d+)', base)
+    label = f"ep{epoch.group(1)}_c{calib.group(1)}" if epoch and calib else base.replace('.log','')
+    bits = 4 if '4bit' in base else 8
+    last_psnr_s, last_psnr_r = None, None
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
-            m_epoch = re.search(r'Train epoch\s+(\d+)', line)
-            if m_epoch:
-                current_epoch = int(m_epoch.group(1))
-            m_test = re.search(r'TEST:\s+PSNR_S:\s+([-\d\.]+)\s+\|\s+PSNR_C:\s+([-\d\.]+)', line)
-            if m_test and current_epoch is not None:
-                psnr_s = float(m_test.group(1))
-                psnr_r = float(m_test.group(2))
-                records.append({
-                    'file': os.path.basename(path),
-                    'bits': bits,
-                    'calibration': calibration,
-                    'epoch': current_epoch,
-                    'PSNR_s': psnr_s,
-                    'PSNR_r': psnr_r,
-                })
-    return records
+            m = re.search(r'TEST:\s+PSNR_S:\s+([-\d\.]+)\s+\|\s+PSNR_C:\s+([-\d\.]+)', line)
+            if m:
+                last_psnr_s = float(m.group(1))
+                last_psnr_r = float(m.group(2))
+    return {'label': label, 'bits': bits, 'PSNR_S': last_psnr_s, 'PSNR_C': last_psnr_r}
 
-
-def load_logs(log_dir: str = LOG_DIR) -> pd.DataFrame:
-    records = []
+def main():
+    log_dir = LOG_DIR
+    logs = []
     for log_path in glob.glob(os.path.join(log_dir, '*.log')):
-        records.extend(parse_log(log_path))
-    return pd.DataFrame(records)
-
-
-def plot_metrics(df: pd.DataFrame) -> None:
-    if df.empty:
-        print('No log data parsed.')
-        return
-    bits_values = sorted(df['bits'].unique())
-    fig, axes = plt.subplots(
-        len(bits_values), 1, figsize=(8, 4 * len(bits_values)), sharex=False
-    )
-    if not isinstance(axes, (list, np.ndarray)):
-        axes = [axes]
-    for ax, bits in zip(axes, bits_values):
-        subset_bits = df[df['bits'] == bits]
-        if subset_bits.empty:
-            continue
-        for calib, sub in subset_bits.groupby('calibration'):
-            calib_label = calib if calib is not None else 'unknown'
-            label_prefix = f'{bits}-bit calib {calib_label}'
-            ax.plot(sub['epoch'], sub['PSNR_s'], label=f'{label_prefix} PSNR_s')
-            ax.plot(
-                sub['epoch'],
-                sub['PSNR_r'],
-                label=f'{label_prefix} PSNR_r',
-                linestyle='--',
-            )
-        ax.set_title(f'{bits}-bit Results')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('PSNR')
-        if ax.lines:
-            ax.legend()
-        ax.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-
-def main() -> None:
-    df = load_logs()
-    print(df.head())
-    plot_metrics(df)
-
+        result = parse_log(log_path)
+        if result['PSNR_S'] is not None:
+            logs.append(result)
+    df = pd.DataFrame(logs)
+    for bits in sorted(df['bits'].unique()):
+        sub = df[df['bits'] == bits]
+        fig, ax = plt.subplots(figsize=(8,5))
+        indices = range(len(sub))
+        width = 0.35
+        ax.bar([i-width/2 for i in indices], sub['PSNR_S'], width, label='PSNR_S')
+        ax.bar([i+width/2 for i in indices], sub['PSNR_C'], width, label='PSNR_C')
+        ax.set_xticks(indices)
+        ax.set_xticklabels(sub['label'], rotation=30, ha='right', fontsize=11)  # 더 짧고, 기울기 작게, 폰트 약간 키움
+        ax.set_title(f"{bits}-bit QAT Experiments")
+        ax.set_ylabel("PSNR (dB)")
+        # legend를 바깥 우상단으로 이동
+        ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), borderaxespad=0)
+        # 더 부드러운 격자선
+        ax.grid(True, which='both', axis='y', linestyle='--', linewidth=0.7, color='gray', alpha=0.4)
+        plt.tight_layout(rect=[0,0,0.88,1])  # 그래프+범례 공간 확보
+        savepath = os.path.join(log_dir, f'qat_psnr_{bits}bit_by_model.png')
+        plt.savefig(savepath)
+        print(f"[그래프 저장] {savepath}")
+        plt.show()
 
 if __name__ == '__main__':
     main()
