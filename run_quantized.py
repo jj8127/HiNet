@@ -39,18 +39,6 @@ def load_quantized(model_path: str) -> nn.Module:
     return model
 
 
-def pair_batches(loader):
-    buffer = []
-    for batch in loader:
-        if batch.ndim == 3:
-            batch = batch.unsqueeze(0)
-        for img in batch:
-            buffer.append(img)
-            if len(buffer) == 2:
-                yield torch.stack(buffer, 0)
-                buffer = []
-    if buffer:
-        print("Warning: ignoring the last image without a pair")
 
 
 def gauss_noise(shape):
@@ -132,16 +120,15 @@ def calculate_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
 def run(model: nn.Module):
     dwt = common.DWT().to(device)
     iwt = common.IWT().to(device)
-    loader = pair_batches(datasets.testloader)
+    loader = datasets.testloader
     psnr_cover_scores = []
     psnr_secret_scores = []
     ssim_cover_scores = []
     ssim_secret_scores = []
     with torch.no_grad():
-        for i, batch in enumerate(loader):
-            batch = batch.to(device)
-            cover = batch[1:]
-            secret = batch[:1]
+        for i, (secret, cover) in enumerate(loader):
+            secret = secret.to(device)
+            cover = cover.to(device)
             cover_in = dwt(cover)
             secret_in = dwt(secret)
             input_img = torch.cat((cover_in, secret_in), 1)

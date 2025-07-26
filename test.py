@@ -71,10 +71,9 @@ iwt = common.IWT()
 
 
 with torch.no_grad():
-    for i, data in enumerate(datasets.testloader):
-        data = data.to(device)
-        cover = data[data.shape[0] // 2 :, :, :, :]
-        secret = data[: data.shape[0] // 2, :, :, :]
+    for i, (secret, cover) in enumerate(datasets.testloader):
+        secret = secret.to(device)
+        cover = cover.to(device)
         cover_input = dwt(cover)
         secret_input = dwt(secret)
         input_img = torch.cat((cover_input, secret_input), 1)

@@ -133,10 +133,10 @@ try:
         #     train:    #
         #################
 
-        for i_batch, data in enumerate(datasets.trainloader):
-            data = data.to(device)
-            cover = data[data.shape[0] // 2 :]
-            secret = data[: data.shape[0] // 2]
+        for i_batch, batch in enumerate(datasets.trainloader):
+            secret, cover = batch
+            secret = secret.to(device)
+            cover = cover.to(device)
             cover_input = dwt(cover)
             secret_input = dwt(secret)
 
@@ -204,10 +204,9 @@ try:
                 psnr_s = []
                 psnr_c = []
                 net.eval()
-                for x in datasets.testloader:
-                    x = x.to(device)
-                    cover = x[x.shape[0] // 2 :, :, :, :]
-                    secret = x[: x.shape[0] // 2, :, :, :]
+                for secret, cover in datasets.testloader:
+                    secret = secret.to(device)
+                    cover = cover.to(device)
                     cover_input = dwt(cover)
                     secret_input = dwt(secret)
 

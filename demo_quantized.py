@@ -37,30 +37,12 @@ def load_quantized(model_path: str) -> nn.Module:
     return model
 
 
-def pair_batches(loader):
-    """Yield batches of two images regardless of original batch size."""
-    buffer = []
-    for batch in loader:
-        if batch.ndim == 3:
-            batch = batch.unsqueeze(0)
-        for img in batch:
-            buffer.append(img)
-            if len(buffer) == 2:
-                yield torch.stack(buffer, 0)
-                buffer = []
-    if buffer:
-        # drop the last unpaired image
-        print("Warning: ignoring the last image without a pair")
-
-
-def run_once(model: nn.Module, batch: torch.Tensor):
+def run_once(model: nn.Module, secret: torch.Tensor, cover: torch.Tensor):
     """Run the model on a pair of images and return the results."""
     dwt = common.DWT().to(device)
     iwt = common.IWT().to(device)
-    batch = batch.to(device)
-    half = batch.size(0) // 2
-    cover = batch[half:]
-    secret = batch[:half]
+    secret = secret.to(device)
+    cover = cover.to(device)
     cover_in = dwt(cover)
     secret_in = dwt(secret)
     input_img = torch.cat((cover_in, secret_in), 1)
@@ -81,11 +63,11 @@ def save_images(images, prefix: str, index: int):
 
 def demo(model_path: str, num_batches: int = 1):
     model = load_quantized(model_path)
-    loader = pair_batches(datasets.testloader)
-    for i, batch in enumerate(loader):
+    loader = datasets.testloader
+    for i, (secret, cover) in enumerate(loader):
         if i >= num_batches:
             break
-        cover, secret, steg, secret_rev = run_once(model, batch)
+        cover, secret, steg, secret_rev = run_once(model, secret, cover)
         save_images([
             (cover, "cover"),
             (secret, "secret"),
