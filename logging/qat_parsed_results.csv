@@ -1,0 +1,9 @@
+file,bits,calibration,epoch,PSNR_s,PSNR_r
+train__4bit_ep50_calib10.log,4,10,50,38.1716,37.9848
+train__4bit_ep30_calib20.log,4,20,30,42.5788,38.603
+train__4bit_ep50_calib20.log,4,20,50,45.4258,40.411
+train__4bit_ep50_calib30.log,4,30,50,43.1572,39.7373
+train__8bit_ep50_calib10.log,8,10,50,46.2757,40.2861
+train__8bit_ep30_calib20.log,8,20,30,45.7177,40.3653
+train__8bit_ep50_calib20.log,8,20,50,46.0205,41.1619
+train__8bit_ep50_calib30.log,8,30,50,46.051,40.7222

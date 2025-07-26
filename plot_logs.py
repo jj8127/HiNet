@@ -3,10 +3,10 @@ import os
 import glob
 import pandas as pd
 import numpy as np
+
 import matplotlib.pyplot as plt
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logging')
-
 
 def parse_log(path: str) -> list[dict]:
     records = []
@@ -79,7 +79,6 @@ def main() -> None:
     df = load_logs()
     print(df.head())
     plot_metrics(df)
-
 
 if __name__ == '__main__':
     main()
