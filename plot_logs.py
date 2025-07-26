@@ -3,7 +3,6 @@ import os
 import glob
 import pandas as pd
 import numpy as np
-
 import matplotlib.pyplot as plt
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logging')

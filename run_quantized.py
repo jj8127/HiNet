@@ -147,21 +147,27 @@ def run(model: nn.Module):
             vutils.save_image(steg_img, os.path.join(c.IMAGE_PATH_steg, f"{i:05d}.png"))
             vutils.save_image(secret_rev, os.path.join(c.IMAGE_PATH_secret_rev, f"{i:05d}.png"))
 
-            # metrics in Y channel
-            cover_np = cover.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            steg_np = steg_img.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            secret_np = secret.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            rev_np = secret_rev.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            # metrics for each image in the batch
+            for b in range(cover.size(0)):
+                c_img = cover[b]
+                s_img = secret[b]
+                steg_b = steg_img[b]
+                rev_b = secret_rev[b]
 
-            cover_y = bgr2ycbcr(cover_np, only_y=True)
-            steg_y = bgr2ycbcr(steg_np, only_y=True)
-            secret_y = bgr2ycbcr(secret_np, only_y=True)
-            rev_y = bgr2ycbcr(rev_np, only_y=True)
+                cover_np = c_img.permute(1, 2, 0).cpu().numpy()
+                steg_np = steg_b.permute(1, 2, 0).cpu().numpy()
+                secret_np = s_img.permute(1, 2, 0).cpu().numpy()
+                rev_np = rev_b.permute(1, 2, 0).cpu().numpy()
 
-            psnr_cover_scores.append(psnr(steg_img, cover))
-            psnr_secret_scores.append(psnr(secret_rev, secret))
-            ssim_cover_scores.append(calculate_ssim(cover_y, steg_y))
-            ssim_secret_scores.append(calculate_ssim(secret_y, rev_y))
+                cover_y = bgr2ycbcr(cover_np, only_y=True)
+                steg_y = bgr2ycbcr(steg_np, only_y=True)
+                secret_y = bgr2ycbcr(secret_np, only_y=True)
+                rev_y = bgr2ycbcr(rev_np, only_y=True)
+
+                psnr_cover_scores.append(psnr(steg_b.unsqueeze(0), c_img.unsqueeze(0)))
+                psnr_secret_scores.append(psnr(rev_b.unsqueeze(0), s_img.unsqueeze(0)))
+                ssim_cover_scores.append(calculate_ssim(cover_y, steg_y))
+                ssim_secret_scores.append(calculate_ssim(secret_y, rev_y))
 
     print(
         f"PSNR cover: {np.mean(psnr_cover_scores):.2f} dB, secret: {np.mean(psnr_secret_scores):.2f} dB"
