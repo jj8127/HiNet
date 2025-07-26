@@ -96,24 +96,10 @@ def evaluate(model, silent=False):
     model.eval()
     scores_cover, scores_secret = [], []
 
-    def pair_batches(loader):
-        buffer = []
-        for batch in loader:
-            if batch.ndim == 3:
-                batch = batch.unsqueeze(0)
-            for img in batch:
-                buffer.append(img)
-                if len(buffer) == 2:
-                    yield torch.stack(buffer, 0)
-                    buffer = []
-        if buffer:
-            logging.warning("ignoring the last image without a pair")
-
     with torch.no_grad():
-        for batch in pair_batches(datasets.testloader):
-            batch = batch.to(device)
-            cover = batch[1:]
-            secret = batch[:1]
+        for secret, cover in datasets.testloader:
+            secret = secret.to(device)
+            cover = cover.to(device)
 
             cover_in = dwt(cover)
             secret_in = dwt(secret)
@@ -147,10 +133,9 @@ def train(model, epochs=1, metrics=None):
         model.train()
         epoch_loss = 0.0
 
-        for data in datasets.trainloader:
-            data = data.to(device)
-            half = data.size(0) // 2
-            cover, secret = data[half:], data[:half]
+        for secret, cover in datasets.trainloader:
+            secret = secret.to(device)
+            cover = cover.to(device)
 
             cover_in = dwt(cover)
             secret_in = dwt(secret)
@@ -202,13 +187,12 @@ def calibrate(model, steps=5, metrics=None):
     with torch.no_grad():
         for step in range(1, steps + 1):
             try:
-                data = next(loader)
+                secret, cover = next(loader)
             except StopIteration:
                 loader = iter(datasets.trainloader)
-                data = next(loader)
-            data = data.to(device)
-            half = data.size(0) // 2
-            cover, secret = data[half:], data[:half]
+                secret, cover = next(loader)
+            secret = secret.to(device)
+            cover = cover.to(device)
 
             input_img = torch.cat((dwt(cover), dwt(secret)), 1)
             assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
