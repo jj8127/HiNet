@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), 'logging')
 
-
 def parse_log(path: str) -> list[dict]:
     records = []
     bits = 4 if '4bit' in os.path.basename(path) else 8
@@ -79,7 +78,6 @@ def main() -> None:
     df = load_logs()
     print(df.head())
     plot_metrics(df)
-
 
 if __name__ == '__main__':
     main()
