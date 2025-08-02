@@ -1,159 +1,77 @@
-# HiNet: Deep Image Hiding by Invertible Network
-This repo is the official code for
+# HiNet: 역변환 네트워크를 이용한 이미지 은닉
 
-* [**HiNet: Deep Image Hiding by Invertible Network.**](https://openaccess.thecvf.com/content/ICCV2021/html/Jing_HiNet_Deep_Image_Hiding_by_Invertible_Network_ICCV_2021_paper.html) 
-  * [*Junpeng Jing*](https://tomtomtommi.github.io/), [*Xin Deng*](http://www.commsp.ee.ic.ac.uk/~xindeng/), [*Mai Xu*](http://shi.buaa.edu.cn/MaiXu/zh_CN/index.htm), [*Jianyi Wang*](http://buaamc2.net/html/Members/jianyiwang.html), [*Zhenyu Guan*](http://cst.buaa.edu.cn/info/1071/2542.htm).
-
-Published on [**ICCV 2021**](http://iccv2021.thecvf.com/home).
-By [MC2 Lab](http://buaamc2.net/) @ [Beihang University](http://ev.buaa.edu.cn/).
+이 저장소는 ICCV 2021에 발표된 **HiNet: Deep Image Hiding by Invertible Network**의 공식 구현입니다. 역변환 가능한 네트워크를 사용하여 비밀 이미지를 커버 이미지에 숨기고 다시 복원할 수 있는 모델을 제공합니다.
 
 <center>
-  <img src=https://github.com/TomTomTommi/HiNet/blob/main/HiNet.png width=60% />
+  <img src="https://github.com/TomTomTommi/HiNet/blob/main/HiNet.png" width="60%" />
 </center>
- 
-## Dependencies and Installation
-- Python 3 (Recommend to use [Anaconda](https://www.anaconda.com/download/#linux)).
-- [PyTorch >= 2.7.1+cu118](https://pytorch.org/).
-- See `environment_torch2.yml` for a sample conda environment using the
-  CUDA 11.8 wheels.
 
-Create the environment and activate it:
+## 환경 및 설치
+- Python 3 (권장: [Anaconda](https://www.anaconda.com/download/#linux))
+- [PyTorch >= 2.7.1 + CUDA 11.8](https://pytorch.org/)
+- 예시 환경은 `environment_torch2.yml`에 제공됩니다.
 
 ```bash
 conda env create -f environment_torch2.yml
 conda activate hinet_pytorch2
 ```
 
+## 기본 사용법
 
-## Get Started
-- Run `python train.py` for training.
+### 1. `config.py` 설정
+모든 하이퍼파라미터와 경로가 `config.py`에 정의되어 있습니다.
+- `TRAIN_PATH`, `VAL_PATH`: 비밀 이미지 데이터 경로
+- `TRAIN_COVER_PATH`, `VAL_COVER_PATH`: 커버 이미지 경로
+- `MODEL_PATH`: 학습된 모델 저장 위치
+- `IMAGE_PATH`: 테스트 시 생성되는 이미지 저장 위치
+- `batch_size`, `epochs`, `lamda_reconstruction` 등의 학습 파라미터를 필요에 따라 조정합니다.
 
-- Run `python test.py` for testing.
+### 2. 학습
+```bash
+python train.py
+```
 
-- Set the model path (where the trained model saved) and the image path (where the image saved during testing) to your local path. 
+### 3. 평가
+```bash
+python test.py
+```
+테스트 전에 `MODEL_PATH`와 `IMAGE_PATH`를 올바른 경로로 수정해야 합니다.
 
-    `line45:  MODEL_PATH = '' ` 
+## 양자화 학습(QAT)
 
-    `line49:  IMAGE_PATH = '' ` 
-
-## Dataset
-- In this paper, we use the commonly used dataset DIV2K, COCO, and ImageNet.
-
-- For train or test on your own dataset, change the code in `config.py`:
-
-    `line30:  TRAIN_PATH = '' ` 
-
-    `line31:  VAL_PATH = '' `
-
-
-## Trained Model
-- Here we provide a trained [model](https://drive.google.com/drive/folders/1l3XBFYPMaNFdvCWyOHfB2qIPkpjIxZgE?usp=sharing).
-
-- Fill in the `MODEL_PATH` and the file name `suffix` before testing by the trained model.
-
-- For example, if the model name is `model.pt` and its path is `/home/usrname/Hinet/model/`,
-set `MODEL_PATH = '/home/usrname/Hinet/model/'` and file name `suffix = 'model.pt'`.
-
-## Partial INT8 Quantization
-The script `qat_8bit.py` demonstrates how to apply mixed precision
-quantization aware training (QAT). All `nn.Conv2d` layers are quantized while
-the `INV_block` modules remain in full precision. The training loop reuses the
-same guide/reconstruction/low-frequency losses from `train.py` so the
-quantized model keeps the original quality. After calibration the script saves
-`model/model_qat_YYYYMMDD-HHMMSS.pt` which can be deployed on devices such as
-Raspberry Pi. Per-step loss and PSNR for both the cover and recovered secret
-images are printed for quick verification.  The script now trains the actual
-image-hiding process for a number of epochs before calibration.
-
-Run the example:
+### 8비트 QAT `qat_8bit.py`
+`nn.Conv2d` 계층만 8비트로 양자화하고 `INV_block`은 FP32로 유지하는 부분 양자화를 수행합니다. 학습과 보정(calibration) 후에는 양자화된 모델이 `model/model_qat_ep{EPOCHS}_calib{STEPS}.pt`로 저장됩니다.
 
 ```bash
 python qat_8bit.py --pretrained /path/to/model.pt \
-                     --epochs 5 --calib-steps 10
+                   --epochs 5 --calib-steps 10
 ```
 
-After conversion, run the demo script to save sample stego and recovered images:
-
-```bash
-python demo_quantized.py --model model/model_qat_YYYYMMDD-HHMMSS.pt
-```
-
-## Partial 4-bit Quantization
-The `qat_4bit.py` script performs QAT using 4-bit fake quantization. The overall
-procedure is the same as in `qat_8bit.py` but each convolution weight and
-activation is quantized to 4 bits while `INV_block` modules remain in full
-precision. After training and calibration the quantized weights are saved as
-`model/model_qat4bit_epEPOCHS_calibSTEPS.pt`.
-
-Example usage:
+### 4비트 QAT `qat_4bit.py`
+4비트 fake quantization을 적용한 QAT를 수행합니다. 사용 방법은 8비트 버전과 동일하며, 결과는 `model/model_qat4bit_ep{EPOCHS}_calib{STEPS}.pt`로 저장됩니다.
 
 ```bash
 python qat_4bit.py --pretrained /path/to/model.pt \
                    --epochs 5 --calib-steps 10
 ```
 
+### 양자화된 모델 사용
+- `demo_quantized.py`: 양자화된 모델을 이용해 예시 이미지를 저장합니다.
+  ```bash
+  python demo_quantized.py --model model/model_qat_ep5_calib10.pt
+  ```
+- `run_quantized.py`: 테스트 세트에서 PSNR/SSIM을 계산하고 스테고/복원 이미지를 저장합니다.
+  ```bash
+  python run_quantized.py --model model/model_qat_ep5_calib10.pt
+  ```
 
-## Training Demo (2021/12/25 Updated)
-- Here we provide a training demo to show how to train a converged model in the early training stage. During this process, the model may suffer from explosion. Our solution is to stop the training process at a normal node and abate the learning rate. Then, continue to train the model.
+## 기타
+- `batchsize_val`은 GPU 수의 두 배 이상이며 GPU 수로 나누어떨어져야 합니다.
+- 사용자 데이터셋을 사용하려면 `config.py`의 경로를 원하는 위치로 변경하십시오.
 
-- Note that in order to log the training process, we have imported `logging` package, with slightly modified `train_logging.py` and `util.py` files.
-
-
-- Stage1: 
-  Run `python train_logging.py` for training with initial `config.py` (learning rate=10^-4.5).
-  
-  The logging file is [train__211222-183515.log](https://github.com/TomTomTommi/HiNet/blob/main/logging/train__211222-183515.log).
-  (The values of r_loss and g_loss are reversed due to a small bug, which has been debuged in stage2.)
-  <br/>
-  <br/>
-  See the tensorboard:
-  <br/>
-  <img src=https://github.com/TomTomTommi/HiNet/blob/main/logging/stage1.png width=60% />
-  <br/>
-  <br/>
-  Note that in the 507-th epoch the model exploded. Thus, we stop the stage1 at epoch 500.
-
-
-- Stage2: 
-  Set `suffix = 'model_checkpoint_00500.pt'` and `tain_next = True` and `trained_epoch = 500`.
-  
-  Change the learning rate from 10^-4.5 to 10^-5.0.
-  
-  Run `python train_logging.py` for training.
-  <br/>
-  The logging file is [train__211223-100502.log](https://github.com/TomTomTommi/HiNet/blob/main/logging/train__211223-100502.log).
-  <br/>
-  <br/>
-  See the tensorboard:
-  <br/>
-  <img src=https://github.com/TomTomTommi/HiNet/blob/main/logging/stage2.png width=60% />
-  <br/>
-  <br/>
-  Note that in the 1692-th epoch the model exploded. Thus, we stop the stage2 at epoch 1690.
-
-
-- Stage3: 
-  Similar operation.
-  
-  Change the learning rate from 10^-5.0 to 10^-5.2.
-  
-  The logging file is [train__211224-105010.log](https://github.com/TomTomTommi/HiNet/blob/main/logging/train__211224-105010.log).
-  <br/>
-  <br/>
-  See the tensorboard:
-  <br/>
-  <img src=https://github.com/TomTomTommi/HiNet/blob/main/logging/stage3.png width=60% />
-  <br/>
-  <br/>
-  We can see that the network has initially converged. Then, you can change the super-parameters lamda according to the PSNR to balance the quality between stego image and recovered image. Note that the PSNR in the tensorboard is RGB-PSNR and in our paper is Y-PSNR.
-
-
-## Others
-- The `batchsize_val` in `config.py` should be at least `2*number of gpus` and it should be divisible by number of gpus.
-
-## Citation
-If you find our paper or code useful for your research, please cite:
-```
+## 인용
+연구나 코드가 도움이 되었다면 다음을 인용해 주세요:
+```text
 @InProceedings{Jing_2021_ICCV,
     author    = {Jing, Junpeng and Deng, Xin and Xu, Mai and Wang, Jianyi and Guan, Zhenyu},
     title     = {HiNet: Deep Image Hiding by Invertible Network},
@@ -162,6 +80,5 @@ If you find our paper or code useful for your research, please cite:
     year      = {2021},
     pages     = {4733-4742}
 }
-
 ```
 
