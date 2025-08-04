@@ -3,7 +3,7 @@ clamp = 2.0
 channels_in = 3
 log10_lr = -4.5
 lr = 10**log10_lr
-epochs = 1000
+epochs = 50
 weight_decay = 1e-5
 init_scale = 0.01
 
@@ -13,7 +13,7 @@ lamda_low_frequency = 1
 device_ids = [0]
 
 # Train:
-batch_size = 16
+batch_size = 8
 cropsize = 224
 betas = (0.5, 0.999)
 weight_step = 1000
@@ -23,7 +23,7 @@ gamma = 0.5
 cropsize_val = 1024
 batchsize_val = 2
 shuffle_val = False
-val_freq = 50
+val_freq = 30
 
 # Dataset
 # Secret image paths
@@ -55,7 +55,7 @@ IMAGE_PATH_steg = IMAGE_PATH + "steg/"
 IMAGE_PATH_secret_rev = IMAGE_PATH + "secret-rev/"
 
 # Load:
-suffix = "model.pt"
+suffix = "finetuning_model_checkpoint_01000.pt"
 tain_next = False
 trained_epoch = 0
 
