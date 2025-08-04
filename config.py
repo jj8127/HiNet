@@ -29,6 +29,7 @@ val_freq = 30
 # Secret image paths
 TRAIN_PATH = './data/wm_train/'
 VAL_PATH = './data/wm_valid/'
+
 # Cover image paths
 TRAIN_COVER_PATH = './data/DIV2K_train_HR/'
 VAL_COVER_PATH = './data/DIV2K_valid_HR/'

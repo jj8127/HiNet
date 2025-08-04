@@ -1,292 +1,250 @@
-#!/usr/bin/env python
-import torch
-import torch.nn
-import torch.optim
-import math
-import numpy as np
-from model import *
-import config as c
-from tensorboardX import SummaryWriter
-import datasets
-import viz
-import modules.Unet_common as common
-import warnings
-import pandas as pd
-import matplotlib.pyplot as plt
+#!/usr/bin/env python3
 import os
-from datetime import datetime
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.ao.quantization as tq
+import logging
 
-warnings.filterwarnings("ignore")
+from hinet import Hinet
+from invblock import INV_block
+import modules.Unet_common as common
+import datasets
+import config as c
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def gauss_noise(shape):
-    noise = torch.zeros(shape).cuda()
-    for i in range(noise.shape[0]):
-        noise[i] = torch.randn(noise[i].shape).cuda()
-    return noise
-
-def guide_loss(output, bicubic_image):
-    loss_fn = torch.nn.MSELoss(reduce=True, size_average=False)
-    loss = loss_fn(output, bicubic_image)
-    return loss.to(device)
-
-def reconstruction_loss(rev_input, input):
-    loss_fn = torch.nn.MSELoss(reduce=True, size_average=False)
-    loss = loss_fn(rev_input, input)
-    return loss.to(device)
-
-def low_frequency_loss(ll_input, gt_input):
-    loss_fn = torch.nn.MSELoss(reduce=True, size_average=False)
-    loss = loss_fn(ll_input, gt_input)
-    return loss.to(device)
-
-def get_parameter_number(net):
-    total_num = sum(p.numel() for p in net.parameters())
-    trainable_num = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    return {'Total': total_num, 'Trainable': trainable_num}
-
-def computePSNR(origin, pred):
-    origin = np.array(origin).astype(np.float32)
-    pred = np.array(pred).astype(np.float32)
-    mse = np.mean((origin / 1.0 - pred / 1.0) ** 2)
-    if mse < 1.0e-10:
-        return 100
-    return 10 * math.log10(255.0 ** 2 / mse)
-
-def load(name):
-    state_dicts = torch.load(name)
-    network_state_dict = {k: v for k, v in state_dicts['net'].items() if 'tmp_var' not in k}
-    net.load_state_dict(network_state_dict, strict=False)
-    try:
-        optim.load_state_dict(state_dicts['opt'])
-    except Exception:
-        print('Cannot load optimizer for some reason or other')
-
-def get_custom_save_name(
-    base_name,
-    qat="qat",
-    bit=8,
-    epoch=None,
-    calib=None,
-    ext=".pt"
-):
-    name = f"{base_name}_{qat}_{bit}bit"
-    if epoch is not None:
-        name += f"_ep{epoch}"
-    if calib is not None:
-        name += f"_calib{calib}"
-    name += ext
-    return name
-
-#####################
-# Model initialize: #
-#####################
-net = Model()
-net.cuda()
-init_model(net)
-
-# 전체 파라미터 freeze
-for param in net.parameters():
-    param.requires_grad = False
-
-# 부분 파라미터만 trainable로 설정 (예: 'inv'와 'conv' 이름 포함된 파라미터)
-for name, param in net.named_parameters():
-    if "inv" in name and "conv" in name:
-        param.requires_grad = True
-print("Trainable params after freezing and partial unfreeze:")
-print(get_parameter_number(net))
-
-net = torch.nn.DataParallel(net, device_ids=c.device_ids)
-params_trainable = [p for p in net.parameters() if p.requires_grad]
-optim = torch.optim.Adam(params_trainable, lr=c.lr, betas=c.betas, eps=1e-6, weight_decay=c.weight_decay)
-weight_scheduler = torch.optim.lr_scheduler.StepLR(optim, c.weight_step, gamma=c.gamma)
-
-# Load pretrained weights for finetuning
-load(c.PRETRAINED_MODEL)
-
-dwt = common.DWT()
-iwt = common.IWT()
-
-now = datetime.now().strftime("%Y%m%d_%H%M%S")
-save_dir = f"logs_{now}"
-os.makedirs(save_dir, exist_ok=True)
-log_csv_path = os.path.join(save_dir, 'training_log.csv')
-
-train_losses = []
-psnr_s_list = []
-psnr_c_list = []
-epochs = []
-
-finetuned_name = os.path.splitext(os.path.basename(c.suffix))[0]
-bit = 8  # QAT bit수, 상황에 따라 수정
-calib_num = c.val_freq
-
-try:
-    writer = SummaryWriter(comment='finetune', filename_suffix='steg')
-
-    for i_epoch in range(c.epochs):
-        i_epoch = i_epoch + c.trained_epoch + 1
-        loss_history = []
-
-        for i_batch, (cover, secret) in enumerate(datasets.trainloader):
-            cover = cover.to(device)
-            secret = secret.to(device)
-            cover_input = dwt(cover)
-            secret_input = dwt(secret)
-            input_img = torch.cat((cover_input, secret_input), 1)
-            output = net(input_img)
-            output_steg = output.narrow(1, 0, 4 * c.channels_in)
-            output_z = output.narrow(1, 4 * c.channels_in, output.shape[1] - 4 * c.channels_in)
-            steg_img = iwt(output_steg)
-            output_z_guass = gauss_noise(output_z.shape)
-            output_rev = torch.cat((output_steg, output_z_guass), 1)
-            output_image = net(output_rev, rev=True)
-            secret_rev = output_image.narrow(1, 4 * c.channels_in, output_image.shape[1] - 4 * c.channels_in)
-            secret_rev = iwt(secret_rev)
-            g_loss = guide_loss(steg_img.cuda(), cover.cuda())
-            r_loss = reconstruction_loss(secret_rev, secret)
-            steg_low = output_steg.narrow(1, 0, c.channels_in)
-            cover_low = cover_input.narrow(1, 0, c.channels_in)
-            l_loss = low_frequency_loss(steg_low, cover_low)
-            total_loss = c.lamda_reconstruction * r_loss + c.lamda_guide * g_loss + c.lamda_low_frequency * l_loss
-            total_loss.backward()
-            optim.step()
-            optim.zero_grad()
-            loss_history.append([total_loss.item(), 0.])
-
-        epoch_losses = np.mean(np.array(loss_history), axis=0)
-        epoch_losses[1] = np.log10(optim.param_groups[0]['lr'])
-
-        # 검증(calibration)
-        if i_epoch % c.val_freq == 0:
-            with torch.no_grad():
-                psnr_s = []
-                psnr_c = []
-                net.eval()
-                for cover, secret in datasets.testloader:
-                    cover = cover.to(device)
-                    secret = secret.to(device)
-                    cover_input = dwt(cover)
-                    secret_input = dwt(secret)
-                    input_img = torch.cat((cover_input, secret_input), 1)
-                    output = net(input_img)
-                    output_steg = output.narrow(1, 0, 4 * c.channels_in)
-                    steg = iwt(output_steg)
-                    output_z = output.narrow(1, 4 * c.channels_in, output.shape[1] - 4 * c.channels_in)
-                    output_z = gauss_noise(output_z.shape)
-                    output_steg = output_steg.cuda()
-                    output_rev = torch.cat((output_steg, output_z), 1)
-                    output_image = net(output_rev, rev=True)
-                    secret_rev = output_image.narrow(1, 4 * c.channels_in, output_image.shape[1] - 4 * c.channels_in)
-                    secret_rev = iwt(secret_rev)
-                    secret_rev = secret_rev.cpu().numpy().squeeze() * 255
-                    np.clip(secret_rev, 0, 255)
-                    secret = secret.cpu().numpy().squeeze() * 255
-                    np.clip(secret, 0, 255)
-                    cover = cover.cpu().numpy().squeeze() * 255
-                    np.clip(cover, 0, 255)
-                    steg = steg.cpu().numpy().squeeze() * 255
-                    np.clip(steg, 0, 255)
-                    psnr_temp = computePSNR(secret_rev, secret)
-                    psnr_s.append(psnr_temp)
-                    psnr_temp_c = computePSNR(cover, steg)
-                    psnr_c.append(psnr_temp_c)
-                writer.add_scalars('PSNR_S', {'average psnr': np.mean(psnr_s)}, i_epoch)
-                writer.add_scalars('PSNR_C', {'average psnr': np.mean(psnr_c)}, i_epoch)
-        else:
-            if len(psnr_s_list) > 0 and len(psnr_c_list) > 0:
-                psnr_s = [psnr_s_list[-1]]
-                psnr_c = [psnr_c_list[-1]]
-            else:
-                psnr_s = [0]
-                psnr_c = [0]
-
-        train_losses.append(epoch_losses[0])
-        psnr_s_list.append(np.mean(psnr_s))
-        psnr_c_list.append(np.mean(psnr_c))
-        epochs.append(i_epoch)
-        viz.show_loss(epoch_losses)
-        writer.add_scalars('Train', {'Train_Loss': epoch_losses[0]}, i_epoch)
-
-        # 중간 저장
-        df = pd.DataFrame({
-            'epoch': epochs,
-            'train_loss': train_losses,
-            'psnr_s': psnr_s_list,
-            'psnr_c': psnr_c_list
-        })
-        df.to_csv(log_csv_path, index=False)
-
-        # QAT 모델 저장 (주기별)
-        if i_epoch > 0 and (i_epoch % c.SAVE_freq) == 0:
-            save_file = get_custom_save_name(
-                base_name=finetuned_name,
-                qat="qat",
-                bit=bit,
-                epoch=i_epoch,
-                calib=calib_num,
-                ext=".pt"
-            )
-            torch.save({'opt': optim.state_dict(),
-                        'net': net.state_dict()}, os.path.join(save_dir, save_file))
-        weight_scheduler.step()
-
-    # 최종 QAT 모델 저장
-    final_save_file = get_custom_save_name(
-        base_name=finetuned_name,
-        qat="qat",
-        bit=bit,
-        epoch="final",
-        calib=calib_num,
-        ext=".pt"
+# ---------------------- 8bit Quantization utils ----------------------
+def get_8bit_qconfig():
+    activation = tq.default_fake_quant.with_args(quant_min=0, quant_max=255)
+    weight = tq.default_per_channel_weight_fake_quant.with_args(
+        quant_min=-128, quant_max=127
     )
-    torch.save({'opt': optim.state_dict(),
-                'net': net.state_dict()}, os.path.join(save_dir, final_save_file))
-    writer.close()
+    return tq.QConfig(activation=activation, weight=weight)
 
-    # 그래프 이미지 저장
-    plt.figure()
-    plt.plot(epochs, train_losses, label='Train Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Train Loss Curve')
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, 'loss_curve.png'))
-    plt.close()
+def mark_quant_layers(module):
+    for child in module.children():
+        if isinstance(child, INV_block):
+            continue  # INV_block은 FP32 유지
+        if isinstance(child, nn.Conv2d):
+            child.qconfig = get_8bit_qconfig()
+        mark_quant_layers(child)
 
-    plt.figure()
-    plt.plot(epochs, psnr_s_list, label='PSNR_S', color='red')
-    plt.xlabel('Epoch')
-    plt.ylabel('PSNR_S')
-    plt.title('PSNR_S Curve')
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, 'psnr_s_curve.png'))
-    plt.close()
+def prepare_model_for_qat(model):
+    model.train()
+    mark_quant_layers(model)
+    tq.prepare_qat(model, inplace=True)
 
-    plt.figure()
-    plt.plot(epochs, psnr_c_list, label='PSNR_C', color='blue')
-    plt.xlabel('Epoch')
-    plt.ylabel('PSNR_C')
-    plt.title('PSNR_C Curve')
-    plt.legend()
-    plt.savefig(os.path.join(save_dir, 'psnr_c_curve.png'))
-    plt.close()
+def convert(model):
+    model.cpu()
+    return tq.convert(model.eval(), inplace=False)
 
-except Exception:
-    if c.checkpoint_on_error:
-        # 에러 상황도 이름에 'ABORT'로 구분
-        abort_file = get_custom_save_name(
-            base_name=finetuned_name,
-            qat="qat",
-            bit=bit,
-            epoch="ABORT",
-            calib=calib_num,
-            ext=".pt"
+def load_pretrained(model, path=None):
+    if path is None:
+        path = os.path.join(c.MODEL_PATH, c.suffix)
+    state = torch.load(path, map_location=device)
+    if isinstance(state, dict):
+        if "net" in state:
+            state = state["net"]
+        elif "state_dict" in state:
+            state = state["state_dict"]
+        elif "model" in state and isinstance(state["model"], dict):
+            state = state["model"]
+    new_state = {}
+    for k, v in state.items():
+        name = k
+        if name.startswith("module.model."):
+            name = name[len("module.model.") :]
+        elif name.startswith("module."):
+            name = name[len("module.") :]
+        if name.startswith("model."):
+            name = name[len("model.") :]
+        new_state[name] = v
+    model.load_state_dict(new_state, strict=False)
+
+def psnr(img1, img2):
+    mse = torch.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return float("inf")
+    return 10 * torch.log10(1.0 / mse).item()
+
+def evaluate(model, silent=False):
+    dwt = common.DWT().to(device)
+    iwt = common.IWT().to(device)
+    model.eval()
+    scores_cover, scores_secret = [], []
+    with torch.no_grad():
+        for secret, cover in datasets.testloader:
+            secret = secret.to(device)
+            cover = cover.to(device)
+            cover_in = dwt(cover)
+            secret_in = dwt(secret)
+            input_img = torch.cat((cover_in, secret_in), 1)
+            output = model(input_img)
+            steg = iwt(output.narrow(1, 0, 4 * c.channels_in))
+            z = torch.randn_like(output.narrow(1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in))
+            rev_input = torch.cat((output.narrow(1, 0, 4 * c.channels_in), z), 1)
+            backward = model(rev_input, rev=True)
+            secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in))
+            scores_cover.append(psnr(steg, cover))
+            scores_secret.append(psnr(secret_rev, secret))
+    mean_cover = float(np.mean(scores_cover))
+    mean_secret = float(np.mean(scores_secret))
+    if not silent:
+        logging.info(f"TEST:   PSNR_S: {mean_secret:.4f} | PSNR_C: {mean_cover:.4f} | ")
+    return mean_cover, mean_secret
+
+def train(model, epochs=1, metrics=None):
+    optim = torch.optim.Adam(model.parameters(), lr=c.lr)
+    dwt = common.DWT().to(device)
+    iwt = common.IWT().to(device)
+    for epoch in range(1, epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        for secret, cover in datasets.trainloader:
+            secret = secret.to(device)
+            cover = cover.to(device)
+            cover_in = dwt(cover)
+            secret_in = dwt(secret)
+            input_img = torch.cat((cover_in, secret_in), 1)
+            output = model(input_img)
+            output_steg = output.narrow(1, 0, 4 * c.channels_in)
+            steg_img = iwt(output_steg)
+            output_z = output.narrow(1, 4 * c.channels_in, output.size(1) - 4 * c.channels_in)
+            noise = torch.randn_like(output_z)
+            rev_input = torch.cat((output_steg, noise), 1)
+            backward = model(rev_input, rev=True)
+            secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in))
+            g_loss = F.mse_loss(steg_img, cover, reduction="sum")
+            r_loss = F.mse_loss(secret_rev, secret, reduction="sum")
+            steg_low = output_steg.narrow(1, 0, c.channels_in)
+            cover_low = cover_in.narrow(1, 0, c.channels_in)
+            l_loss = F.mse_loss(steg_low, cover_low, reduction="sum")
+            loss = (
+                c.lamda_reconstruction * r_loss
+                + c.lamda_guide * g_loss
+                + c.lamda_low_frequency * l_loss
+            )
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+            epoch_loss += loss.item()
+        avg = epoch_loss / max(1, len(datasets.trainloader))
+        logging.info(
+            f"Train epoch {epoch}:   Loss: {avg:.4f} | r_Loss: {r_loss.item():.4f} | g_Loss: {g_loss.item():.4f} | l_Loss: {l_loss.item():.4f} | "
         )
-        torch.save({'opt': optim.state_dict(),
-                    'net': net.state_dict()}, os.path.join(save_dir, abort_file))
-    raise
+        if metrics is not None:
+            metrics["loss"].append(avg)
+            ps_cover, ps_secret = evaluate(model, silent=True)
+            metrics["psnr_train_cover"].append(ps_cover)
+            metrics["psnr_train_secret"].append(ps_secret)
 
-finally:
-    viz.signal_stop()
+def calibrate(model, steps=5, metrics=None):
+    model.eval()
+    dwt = common.DWT().to(device)
+    loader = iter(datasets.trainloader)
+    with torch.no_grad():
+        for step in range(1, steps + 1):
+            try:
+                secret, cover = next(loader)
+            except StopIteration:
+                loader = iter(datasets.trainloader)
+                secret, cover = next(loader)
+            secret = secret.to(device)
+            cover = cover.to(device)
+            input_img = torch.cat((dwt(cover), dwt(secret)), 1)
+            assert input_img.size(1) == 24, f"expected 24 channels, got {input_img.size(1)}"
+            model(input_img)
+            if metrics is not None:
+                ps_cover, ps_secret = evaluate(model, silent=True)
+                metrics["psnr_calib_cover"].append(ps_cover)
+                metrics["psnr_calib_secret"].append(ps_secret)
+            logging.info(f"Calibration step {step}/{steps} done.")
+
+def plot_metrics(metrics, label):
+    os.makedirs("logging", exist_ok=True)
+    np.savez(os.path.join("logging", f"qat_metrics_{label}.npz"), **metrics)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    axes[0].plot(range(1, len(metrics["psnr_train_cover"]) + 1), metrics["psnr_train_cover"])
+    axes[0].set_title("PSNR_C")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("dB")
+    axes[0].grid(True)
+    axes[1].plot(range(1, len(metrics["psnr_train_secret"]) + 1), metrics["psnr_train_secret"], color="red")
+    axes[1].set_title("PSNR_S")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("dB")
+    axes[1].grid(True)
+    axes[2].plot(range(1, len(metrics["loss"]) + 1), metrics["loss"])
+    axes[2].set_title("Train Loss")
+    axes[2].set_xlabel("Epoch")
+    axes[2].set_ylabel("Loss")
+    axes[2].grid(True)
+    fig.tight_layout()
+    png_path = os.path.join("logging", f"stage1_{label}.png")
+    fig.savefig(png_path)
+    plt.close(fig)
+    logging.info(f"saved plots to {png_path}")
+
+def setup_logger(label):
+    os.makedirs("logging", exist_ok=True)
+    log_path = os.path.join("logging", f"train__{label}.log")
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    fmt = "%(asctime)s - %(levelname)s: %(message)s"
+    datefmt = "%y-%m-%d %H:%M:%S"
+    logging.basicConfig(
+        level=logging.INFO,
+        format=fmt,
+        datefmt=datefmt,
+        handlers=[
+            logging.FileHandler(log_path, mode="w"),
+            logging.StreamHandler()
+        ],
+    )
+    logging.info("Logger initialized")
+    return log_path
+
+def main(pretrained=None, epochs=1, calib_steps=5):
+    label = f"8bit_ep{epochs}_calib{calib_steps}"
+    log_file = setup_logger(label)
+    logging.info(f"Label: {label}")
+    logging.info(f"Device: {device}")
+
+    metrics = {
+        "loss": [],
+        "psnr_train_cover": [],
+        "psnr_train_secret": [],
+        "psnr_calib_cover": [],
+        "psnr_calib_secret": [],
+    }
+
+    model = Hinet().to(device)
+    load_pretrained(model, pretrained)
+    prepare_model_for_qat(model)
+
+    train(model, epochs=epochs, metrics=metrics)
+    calibrate(model, steps=calib_steps, metrics=metrics)
+
+    qmodel = convert(model)
+    evaluate(qmodel.to(device))
+
+    os.makedirs("model", exist_ok=True)
+    save_path = os.path.join("model", f"model_qat8bit_{label}.pt")
+    torch.save(qmodel.state_dict(), save_path)
+    logging.info(f"quantized model saved to {save_path}")
+
+    plot_metrics(metrics, label)
+    logging.info(f"training log saved to {log_file}")
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Run partial 8-bit QAT")
+    parser.add_argument("--pretrained", type=str, default=None, help="path to FP32 model")
+    parser.add_argument("--epochs", type=int, default=50, help="number of QAT training epochs")
+    parser.add_argument("--calib-steps", type=int, default=10, help="number of calibration batches")
+    args = parser.parse_args()
+    main(pretrained=args.pretrained, epochs=args.epochs, calib_steps=args.calib_steps)
