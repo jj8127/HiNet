@@ -263,7 +263,8 @@ def main(pretrained=None, epochs=1, calib_steps=5, checkpoint_interval=10):
     qmodel = convert(model)
     evaluate(qmodel.to(device))
 
-    final_model_path = os.path.join(save_dir, f"finetuned_model_qat.pt")
+    # --- 최종 모델을 실험 디렉토리 밑에 저장 ---
+    final_model_path = os.path.join(save_dir, "finetuned_model_qat.pt")
     torch.save(qmodel.state_dict(), final_model_path)
     logging.info(f"Quantized model saved to {final_model_path}")
 
