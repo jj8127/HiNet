@@ -233,7 +233,7 @@ def main(pretrained=None, epochs=1, calib_steps=5):
     evaluate(qmodel.to(device))
 
     os.makedirs("model", exist_ok=True)
-    save_path = os.path.join("model", f"model_qat8bit_{label}.pt")
+    save_path = os.path.join("model", f"finetuned_model_qat_{label}.pt")
     torch.save(qmodel.state_dict(), save_path)
     logging.info(f"quantized model saved to {save_path}")
 
