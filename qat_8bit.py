@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.ao.quantization as tq
 import logging
+from datetime import datetime
+import pandas as pd
 
 from hinet import Hinet
 from invblock import INV_block
@@ -96,10 +98,11 @@ def evaluate(model, silent=False):
         logging.info(f"TEST:   PSNR_S: {mean_secret:.4f} | PSNR_C: {mean_cover:.4f} | ")
     return mean_cover, mean_secret
 
-def train(model, epochs=1, metrics=None):
+def train(model, epochs=1, metrics=None, checkpoint_interval=10, label=None, save_dir=None):
     optim = torch.optim.Adam(model.parameters(), lr=c.lr)
     dwt = common.DWT().to(device)
     iwt = common.IWT().to(device)
+    os.makedirs(save_dir, exist_ok=True)
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
@@ -141,6 +144,16 @@ def train(model, epochs=1, metrics=None):
             metrics["psnr_train_cover"].append(ps_cover)
             metrics["psnr_train_secret"].append(ps_secret)
 
+        # --- checkpoint 저장 (10 에폭마다, 또는 첫 에폭) ---
+        if (checkpoint_interval is not None) and (epoch % checkpoint_interval == 0 or epoch == 1):
+            if label is None:
+                checkpoint_label = f"epoch{epoch}"
+            else:
+                checkpoint_label = f"{label}_epoch{epoch}"
+            ckpt_path = os.path.join(save_dir, f"checkpoint_{checkpoint_label}.pt")
+            torch.save(model.state_dict(), ckpt_path)
+            logging.info(f"Checkpoint saved at epoch {epoch} to {ckpt_path}")
+
 def calibrate(model, steps=5, metrics=None):
     model.eval()
     dwt = common.DWT().to(device)
@@ -163,9 +176,8 @@ def calibrate(model, steps=5, metrics=None):
                 metrics["psnr_calib_secret"].append(ps_secret)
             logging.info(f"Calibration step {step}/{steps} done.")
 
-def plot_metrics(metrics, label):
-    os.makedirs("logging", exist_ok=True)
-    np.savez(os.path.join("logging", f"qat_metrics_{label}.npz"), **metrics)
+def plot_metrics(metrics, save_dir):
+    np.savez(os.path.join(save_dir, f"qat_metrics.npz"), **metrics)
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     axes[0].plot(range(1, len(metrics["psnr_train_cover"]) + 1), metrics["psnr_train_cover"])
     axes[0].set_title("PSNR_C")
@@ -183,14 +195,25 @@ def plot_metrics(metrics, label):
     axes[2].set_ylabel("Loss")
     axes[2].grid(True)
     fig.tight_layout()
-    png_path = os.path.join("logging", f"stage1_{label}.png")
+    png_path = os.path.join(save_dir, f"metrics_plot.png")
     fig.savefig(png_path)
     plt.close(fig)
-    logging.info(f"saved plots to {png_path}")
+    logging.info(f"Saved plots to {png_path}")
 
-def setup_logger(label):
-    os.makedirs("logging", exist_ok=True)
-    log_path = os.path.join("logging", f"train__{label}.log")
+    # CSV로 저장
+    df = pd.DataFrame({
+        "epoch": list(range(1, len(metrics["loss"]) + 1)),
+        "loss": metrics["loss"],
+        "psnr_train_cover": metrics["psnr_train_cover"],
+        "psnr_train_secret": metrics["psnr_train_secret"],
+    })
+    csv_path = os.path.join(save_dir, "metrics.csv")
+    df.to_csv(csv_path, index=False)
+    logging.info(f"Saved metrics csv to {csv_path}")
+
+def setup_logger(save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    log_path = os.path.join(save_dir, "train.log")
     root = logging.getLogger()
     for h in root.handlers[:]:
         root.removeHandler(h)
@@ -208,11 +231,19 @@ def setup_logger(label):
     logging.info("Logger initialized")
     return log_path
 
-def main(pretrained=None, epochs=1, calib_steps=5):
-    label = f"8bit_ep{epochs}_calib{calib_steps}"
-    log_file = setup_logger(label)
+def get_save_dir(epochs, calib_steps):
+    now = datetime.now()
+    date_str = now.strftime("%Y_%m_%d_%H-%M")
+    label = f"qat_8bit_{date_str}_ep{epochs}_calib{calib_steps}"
+    save_dir = os.path.join("logging", label)
+    return save_dir, label
+
+def main(pretrained=None, epochs=1, calib_steps=5, checkpoint_interval=10):
+    save_dir, label = get_save_dir(epochs, calib_steps)
+    log_file = setup_logger(save_dir)
     logging.info(f"Label: {label}")
     logging.info(f"Device: {device}")
+    logging.info(f"Save directory: {save_dir}")
 
     metrics = {
         "loss": [],
@@ -226,19 +257,18 @@ def main(pretrained=None, epochs=1, calib_steps=5):
     load_pretrained(model, pretrained)
     prepare_model_for_qat(model)
 
-    train(model, epochs=epochs, metrics=metrics)
+    train(model, epochs=epochs, metrics=metrics, checkpoint_interval=checkpoint_interval, label=label, save_dir=save_dir)
     calibrate(model, steps=calib_steps, metrics=metrics)
 
     qmodel = convert(model)
     evaluate(qmodel.to(device))
 
-    os.makedirs("model", exist_ok=True)
-    save_path = os.path.join("model", f"finetuned_model_qat_{label}.pt")
-    torch.save(qmodel.state_dict(), save_path)
-    logging.info(f"quantized model saved to {save_path}")
+    final_model_path = os.path.join(save_dir, f"finetuned_model_qat.pt")
+    torch.save(qmodel.state_dict(), final_model_path)
+    logging.info(f"Quantized model saved to {final_model_path}")
 
-    plot_metrics(metrics, label)
-    logging.info(f"training log saved to {log_file}")
+    plot_metrics(metrics, save_dir)
+    logging.info(f"Training log saved to {log_file}")
 
 if __name__ == "__main__":
     import argparse
@@ -246,5 +276,11 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained", type=str, default=None, help="path to FP32 model")
     parser.add_argument("--epochs", type=int, default=50, help="number of QAT training epochs")
     parser.add_argument("--calib-steps", type=int, default=10, help="number of calibration batches")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="number of epochs per checkpoint")
     args = parser.parse_args()
-    main(pretrained=args.pretrained, epochs=args.epochs, calib_steps=args.calib_steps)
+    main(
+        pretrained=args.pretrained,
+        epochs=args.epochs,
+        calib_steps=args.calib_steps,
+        checkpoint_interval=args.checkpoint_interval,
+    )
