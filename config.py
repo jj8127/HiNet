@@ -1,7 +1,7 @@
 # Super parameters
 clamp = 2.0
 channels_in = 3
-log10_lr = -4.5
+log10_lr = -4
 lr = 10**log10_lr
 epochs = 50
 weight_decay = 1e-5
@@ -16,8 +16,8 @@ device_ids = [0]
 batch_size = 8
 cropsize = 224
 betas = (0.5, 0.999)
-weight_step = 1000
-gamma = 0.5
+weight_step = 10
+gamma = 0.7
 
 # Val:
 cropsize_val = 1024
@@ -56,7 +56,7 @@ IMAGE_PATH_steg = IMAGE_PATH + "steg/"
 IMAGE_PATH_secret_rev = IMAGE_PATH + "secret-rev/"
 
 # Load:
-suffix = "finetuning_model_checkpoint_01000.pt"
+suffix = "model.pt"
 tain_next = False
 trained_epoch = 0
 
