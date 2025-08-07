@@ -3,8 +3,11 @@ import os
 import csv
 import glob
 import torch
+import torch.nn as nn
+import torch.ao.quantization as tq
 import numpy as np
-from model import Model, init_model
+from hinet import Hinet
+from invblock import INV_block
 import config as c
 from torch.utils.data import DataLoader
 import datasets
@@ -12,26 +15,27 @@ import modules.Unet_common as common
 from calculate_PSNR_SSIM import calculate_psnr, calculate_ssim
 from tqdm import tqdm
 
-def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device=None) -> None:
-    state_dicts = torch.load(ckpt_path, map_location="cpu")
-    if "net" in state_dicts:
-        state = state_dicts["net"]
-    elif "state_dict" in state_dicts:
-        state = state_dicts["state_dict"]
-    elif "model" in state_dicts and isinstance(state_dicts["model"], dict):
-        state = state_dicts["model"]
-    else:
-        state = state_dicts
-    new_state = {}
-    for k, v in state.items():
-        name = k
-        if name.startswith("module."):
-            name = name[len("module.") :]
-        new_state[name] = v
-    new_state = {k: v for k, v in new_state.items() if "tmp_var" not in k}
-    model.load_state_dict(new_state, strict=False)
-    if device is not None:
-        model.to(device)
+def mark_quant_layers(module: nn.Module) -> None:
+    """Assign QAT qconfig to convolution layers except those inside INV_block."""
+    for child in module.children():
+        if isinstance(child, INV_block):
+            continue
+        if isinstance(child, nn.Conv2d):
+            child.qconfig = tq.get_default_qat_qconfig("fbgemm")
+        mark_quant_layers(child)
+
+
+def load_quantized_model(model_path: str, device: torch.device) -> nn.Module:
+    """Load a quantized model checkpoint prepared via QAT."""
+    model = Hinet()
+    mark_quant_layers(model)
+    tq.prepare_qat(model, inplace=True)
+    model = tq.convert(model.eval(), inplace=True)
+    state = torch.load(model_path, map_location="cpu")
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+    return model
 
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
     img = tensor.detach().cpu().numpy()
@@ -46,12 +50,9 @@ def save_img(np_img, save_dir, img_name):
     Image.fromarray(np_img).save(os.path.join(save_dir, img_name))
 
 def evaluate(model_path: str) -> str:
-    device = torch.device("cuda:0")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Evaluation will be performed on device: {device}")
-    net = Model()
-    init_model(net)
-    load_checkpoint(net, model_path, device=device)
-    net.eval()
+    net = load_quantized_model(model_path, device)
 
     dwt = common.DWT().to(device)
     iwt = common.IWT().to(device)
