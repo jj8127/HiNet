@@ -56,9 +56,9 @@ IMAGE_PATH_steg = IMAGE_PATH + "steg/"
 IMAGE_PATH_secret_rev = IMAGE_PATH + "secret-rev/"
 
 # Load:
-suffix = "model.pt"
+suffix = "finetuned_model.pt"
 tain_next = False
 trained_epoch = 0
 
 # Path to a pretrained checkpoint for finetuning
-PRETRAINED_MODEL = './model/model.pt'
+PRETRAINED_MODEL = './model/pretrained_model.pt'

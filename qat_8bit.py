@@ -16,7 +16,7 @@ import modules.Unet_common as common
 import datasets
 import config as c
 
-device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # ---------------------- 8bit Quantization utils ----------------------
 def get_8bit_qconfig():
@@ -264,7 +264,7 @@ def main(pretrained=None, epochs=1, calib_steps=5, checkpoint_interval=10):
     evaluate(qmodel.to(device))
 
     # --- 최종 모델을 실험 디렉토리 밑에 저장 ---
-    final_model_path = os.path.join(save_dir, "pretrained_model_qat.pt")
+    final_model_path = os.path.join(save_dir, "finetuned_model_qat.pt")
     torch.save(qmodel.state_dict(), final_model_path)
     logging.info(f"Quantized model saved to {final_model_path}")
 
