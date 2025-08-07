@@ -12,28 +12,31 @@ from torch.utils.data import DataLoader
 import datasets
 import modules.Unet_common as common
 from calculate_PSNR_SSIM import calculate_psnr, calculate_ssim
+from tqdm import tqdm
 
 
-def load_checkpoint(model: torch.nn.Module, ckpt_path: str) -> None:
-    """Load model weights from checkpoint."""
+def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device=None) -> None:
     state_dicts = torch.load(ckpt_path, map_location="cpu")
-    network_state_dict = {
-        k: v for k, v in state_dicts["net"].items() if "tmp_var" not in k
-    }
-    model.load_state_dict(network_state_dict)
 
+    if "net" in state_dicts:
+        state = state_dicts["net"]
+    elif "state_dict" in state_dicts:
+        state = state_dicts["state_dict"]
+    elif "model" in state_dicts and isinstance(state_dicts["model"], dict):
+        state = state_dicts["model"]
+    else:
+        state = state_dicts
 
-def verify_pairs(secret_files: List[str], cover_files: List[str]) -> None:
-    """Ensure image files match by name and count."""
-    if len(secret_files) != len(cover_files):
-        raise ValueError(
-            f"Mismatched image counts: {len(secret_files)} secret vs {len(cover_files)} cover"
-        )
-    for s, c_path in zip(secret_files, cover_files):
-        if os.path.basename(s) != os.path.basename(c_path):
-            raise ValueError(
-                f"Filename mismatch: {os.path.basename(s)} vs {os.path.basename(c_path)}"
-            )
+    new_state = {}
+    for k, v in state.items():
+        name = k
+        if name.startswith("module."):
+            name = name[len("module.") :]
+        new_state[name] = v
+    new_state = {k: v for k, v in new_state.items() if "tmp_var" not in k}
+    model.load_state_dict(new_state, strict=False)
+    if device is not None:
+        model.to(device)
 
 
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
@@ -44,18 +47,18 @@ def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
 
 
 def evaluate(model_path: str) -> str:
-    device = torch.device("cpu")
-    net = Model().to(device)
+    device = torch.device("cuda:0")
+    print(f"Evaluation will be performed on device: {device}")
+    net = Model()
     init_model(net)
-    load_checkpoint(net, model_path)
+    load_checkpoint(net, model_path, device=device)
     net.eval()
 
-    dwt = common.DWT()
-    iwt = common.IWT()
+    dwt = common.DWT().to(device)
+    iwt = common.IWT().to(device)
 
     secret_files = sorted(glob.glob(os.path.join(c.VAL_PATH, f"*.{c.format_val}")))
     cover_files = sorted(glob.glob(os.path.join(c.VAL_COVER_PATH, f"*.{c.format_val}")))
-    verify_pairs(secret_files, cover_files)
 
     dataset = datasets.HinetDataset(
         c.VAL_PATH, c.VAL_COVER_PATH, datasets.transform_val, c.format_val
@@ -64,10 +67,10 @@ def evaluate(model_path: str) -> str:
 
     psnr_c_list, psnr_r_list = [], []
     ssim_c_list, ssim_r_list, ssim_avg_list = [], [], []
-    img_names = [os.path.basename(f) for f in secret_files]
+    img_names = [f"{i+1:04d}.png" for i in range(len(secret_files))]
 
     with torch.no_grad():
-        for idx, (secret, cover) in enumerate(loader):
+        for idx, (secret, cover) in tqdm(enumerate(loader), total=len(loader), desc="Evaluating"):
             secret = secret.to(device)
             cover = cover.to(device)
 
@@ -79,7 +82,7 @@ def evaluate(model_path: str) -> str:
             output_steg = output[:, : 4 * c.channels_in]
             output_z = output[:, 4 * c.channels_in :]
             steg_img = iwt(output_steg)
-            backward_z = torch.randn_like(output_z)
+            backward_z = torch.randn_like(output_z).to(device)
 
             output_rev = torch.cat((output_steg, backward_z), 1)
             backward_img = net(output_rev, rev=True)
@@ -127,6 +130,7 @@ def evaluate(model_path: str) -> str:
             f"{avg_ssim_r:.6f}",
             f"{avg_ssim_avg:.6f}",
         ])
+    print(f"Saved evaluation results to {csv_path}")
     return csv_path
 
 
