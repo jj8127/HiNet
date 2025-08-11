@@ -17,11 +17,10 @@ import datasets
 import config as c
 
 # ---------------------- Device & Quant engine ----------------------
-# 학습/퍼섭(준비)은 GPU 사용, "양자화 추론"은 CPU에서만 동작하도록 분리
-device_train = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+device_train = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
 device_cpu = torch.device("cpu")
 
-# 라즈파이(ARM)에서는 qnnpack, x86에서는 fbgemm 권장
+# ARM(라즈파이) → qnnpack, x86 → fbgemm
 try:
     engines = torch.backends.quantized.supported_engines
     if "qnnpack" in engines:
@@ -31,51 +30,64 @@ try:
 except Exception:
     pass
 
+# ---------------------- Q/DQ 래퍼 ----------------------
+class QATWrapper(nn.Module):
+    """
+    모델 입출력에 QuantStub/DeQuantStub를 붙여 INT8 경로가 실제로 동작하도록 하는 래퍼.
+    convert() 이후에는 nn.quantized.* 모듈들과 함께 CPU의 Quantized 백엔드에서 실행됨.
+    """
+    def __init__(self, core: nn.Module):
+        super().__init__()
+        self.core = core
+        self.quant = tq.QuantStub()
+        self.dequant = tq.DeQuantStub()
+
+    def forward(self, x, rev: bool = False):
+        x_q = self.quant(x)          # FP32 -> (QAT시 fake, convert후 qint8)
+        y_q = self.core(x_q, rev=rev)
+        y   = self.dequant(y_q)      # (QAT시 fake, convert후 qint8 -> FP32)
+        return y
+
 # ---------------------- 8bit Quantization utils ----------------------
 def get_8bit_qconfig():
-    # FakeQuant 설정 (QAT용). convert 후엔 실제 quantized 모듈로 치환됨.
     activation = tq.default_fake_quant.with_args(quant_min=0, quant_max=255)
     weight = tq.default_per_channel_weight_fake_quant.with_args(
         quant_min=-128, quant_max=127
     )
     return tq.QConfig(activation=activation, weight=weight)
 
-def mark_quant_layers(module):
-    # INV_block은 제외(요구사항), Conv2d만 QAT 적용
+def mark_quant_layers(module: nn.Module):
+    """
+    모델 전역을 재귀 순회하면서 Conv2d에 qconfig를 부착.
+    INV_block이라고 막지 않고 내부 Conv까지 진입.
+    """
     for child in module.children():
-        if isinstance(child, INV_block):
-            continue  # INV_block은 FP32 유지
+        mark_quant_layers(child)
         if isinstance(child, nn.Conv2d):
             child.qconfig = get_8bit_qconfig()
-        mark_quant_layers(child)
 
-def prepare_model_for_qat(model):
+def prepare_model_for_qat(model: nn.Module):
     model.train()
-    mark_quant_layers(model)
-    # (선택) fuse 가능하다면 여기서 Conv+ReLU/BN fuse 수행
-    # tq.fuse_modules(model, [...])  # 모델 구조에 맞게
-    tq.prepare_qat(model, inplace=True)
+    mark_quant_layers(model)        # Conv들에 qconfig 부착
+    tq.prepare_qat(model, inplace=True)  # 관측자/가짜양자 삽입
 
-def convert_to_int8_cpu(model_fp32_qat: nn.Module) -> nn.Module:
+def convert_to_int8_cpu(model_qat: nn.Module) -> nn.Module:
     """
-    QAT가 적용된 FP32(fake-quant) 모델을 '실제 양자화 모듈'로 변환.
-    반드시 CPU 상에서 사용해야 함(양자화 커널은 CPU 전용).
+    QAT(FakeQuant) 모델을 실제 양자화 모듈로 변환. 변환 및 추론은 CPU에서만 유효.
     """
-    model_fp32_qat.eval()
-    model_fp32_qat.cpu()
-    qmodel = tq.convert(model_fp32_qat, inplace=False)
-    qmodel.eval()
+    model_qat.eval()
+    model_qat.cpu()
+    qmodel = tq.convert(model_qat, inplace=False).eval()
     return qmodel
 
-def load_pretrained(model, path=None):
+def load_pretrained(model: nn.Module, path=None):
     if path is None:
         path = os.path.join(c.MODEL_PATH, c.suffix)
-    # 항상 CPU로 로드 → 모델에 주입 후 필요 시 .to(device_train)
     state = torch.load(path, map_location="cpu")
     if isinstance(state, dict):
-        if "net" in state:
+        if "net" in state and isinstance(state["net"], dict):
             state = state["net"]
-        elif "state_dict" in state:
+        elif "state_dict" in state and isinstance(state["state_dict"], dict):
             state = state["state_dict"]
         elif "model" in state and isinstance(state["model"], dict):
             state = state["model"]
@@ -96,6 +108,13 @@ def psnr(img1, img2):
     if mse == 0:
         return float("inf")
     return 10 * torch.log10(1.0 / mse).item()
+
+def count_qconfig_modules(model: nn.Module) -> int:
+    n = 0
+    for m in model.modules():
+        if hasattr(m, "qconfig") and m.qconfig is not None:
+            n += 1
+    return n
 
 # ---------------------- Eval (device 주입형) ----------------------
 def evaluate(model: nn.Module, dev: torch.device, silent=False):
@@ -118,8 +137,8 @@ def evaluate(model: nn.Module, dev: torch.device, silent=False):
             secret_rev = iwt(backward.narrow(1, 4 * c.channels_in, backward.size(1) - 4 * c.channels_in))
             scores_cover.append(psnr(steg, cover))
             scores_secret.append(psnr(secret_rev, secret))
-    mean_cover = float(np.mean(scores_cover)) if len(scores_cover) else 0.0
-    mean_secret = float(np.mean(scores_secret)) if len(scores_secret) else 0.0
+    mean_cover = float(np.mean(scores_cover)) if scores_cover else 0.0
+    mean_secret = float(np.mean(scores_secret)) if scores_secret else 0.0
     if not silent:
         logging.info(f"TEST:   PSNR_S: {mean_secret:.4f} | PSNR_C: {mean_cover:.4f} | ")
     return mean_cover, mean_secret
@@ -224,7 +243,6 @@ def plot_metrics(metrics, save_dir):
     plt.close(fig)
     logging.info(f"Saved plots to {png_path}")
 
-    # CSV로 저장
     df = pd.DataFrame({
         "epoch": list(range(1, len(metrics["loss"]) + 1)),
         "loss": metrics["loss"],
@@ -279,27 +297,38 @@ def main(pretrained=None, epochs=1, calib_steps=5, checkpoint_interval=10, expor
         "psnr_calib_secret": [],
     }
 
-    # 1) FP32 모델 로드 & QAT 준비 (GPU)
-    model = Hinet().to(device_train)
-    load_pretrained(model, pretrained)
+    # 1) FP32 모델 로드 → Q/DQ 래퍼로 감싸기
+    core = Hinet().to(device_train)
+    load_pretrained(core, pretrained)
+
+    model = QATWrapper(core).to(device_train)
+    # 선택) channels_last 최적화
+    # model = model.to(memory_format=torch.channels_last)
+
+    # qconfig 부착 & 준비
     prepare_model_for_qat(model)
 
-    # 2) 학습 & 캘리브레이션 (GPU)
+    # qconfig 부착 개수 확인
+    n_qcfg = count_qconfig_modules(model)
+    logging.info(f"Num modules with qconfig: {n_qcfg}")
+    if n_qcfg == 0:
+        logging.warning("No qconfig attached. Quantization will NOT happen. Check mark_quant_layers().")
+
+    # 2) 학습 & 캘리브레이션 (GPU/가용 디바이스)
     train(model, epochs=epochs, metrics=metrics, checkpoint_interval=checkpoint_interval, label=label, save_dir=save_dir)
     calibrate(model, steps=calib_steps, metrics=metrics)
 
-    # 3) 실제 양자화 변환 (CPU) + CPU에서 평가
+    # 3) 실제 양자화 변환 (CPU) + CPU 평가
     qmodel = convert_to_int8_cpu(model)
 
-    # 양자화 모듈 확인 로그
-    quant_classes = [m.__class__.__name__ for m in qmodel.modules() if 'quantized' in m.__class__.__module__]
-    logging.info(f"Quantized modules found: {sorted(set(quant_classes))} (count={len(quant_classes)})")
+    # 양자화 모듈 확인
+    qmods = [m for m in qmodel.modules() if 'quantized' in m.__class__.__module__]
+    logging.info(f"Quantized modules: {[type(m).__name__ for m in qmods]} (count={len(qmods)})")
 
-    # CPU에서만 평가 (중요!)
     ps_c, ps_s = evaluate(qmodel, dev=device_cpu, silent=False)
     logging.info(f"[INT8@CPU] PSNR_C: {ps_c:.4f} | PSNR_S: {ps_s:.4f}")
 
-    # 4) 저장 (전체 모델 권장) + 선택적 TorchScript
+    # 4) 모델 저장(전체 저장 권장) + 옵션: TorchScript
     final_model_path = os.path.join(save_dir, "finetuned_model_qat.pt")
     torch.save(qmodel, final_model_path)
     logging.info(f"Quantized model (full) saved to {final_model_path}")
@@ -310,16 +339,16 @@ def main(pretrained=None, epochs=1, calib_steps=5, checkpoint_interval=10, expor
         scripted.save(ts_path)
         logging.info(f"TorchScript model saved to {ts_path}")
 
-    # 5) 로그/그래프
+    # 5) 로그/플롯
     plot_metrics(metrics, save_dir)
     logging.info(f"Training log saved to {log_file}")
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Run partial 8-bit QAT with real int8 inference on CPU")
+    parser = argparse.ArgumentParser(description="Run 8-bit QAT with real int8 CPU inference")
     parser.add_argument("--pretrained", type=str, default=None, help="path to FP32 model")
     parser.add_argument("--epochs", type=int, default=50, help="number of QAT training epochs")
-    parser.add_argument("--calib-steps", type=int, default=10, help="number of calibration batches")
+    parser.add_argument("--calib-steps", type=int, default=20, help="number of calibration batches")
     parser.add_argument("--checkpoint-interval", type=int, default=10, help="epochs per checkpoint")
     parser.add_argument("--export-scripted", action="store_true", help="export TorchScript int8 model")
     args = parser.parse_args()
