@@ -1,9 +1,10 @@
 # evaluate_QAT_model.py
-# - 커버 해상도 유지(풀 이미지), 시크릿만 커버 크기로 리사이즈
-# - DWT 짝수 조건은 패딩(reflect)으로 해결 (크롭 없음)
-# - 채널 순서: 입력 x = [secret_dwt, cover_dwt]
+# - 커버 해상도 유지(풀 이미지), 시크릿만 리사이즈 + 패딩(짝수화)
+# - 모델 로딩: 1) 같은 폴더의 last.pth 있으면 QAT -> INT8 재구성(CPU, fbgemm/qnnpack)
+#             2) 없으면 eager .pt 그대로 사용(추가 .to()/.eval() 안 함)
 # - 저장: /root/Desktop/HiNet/image/{cover|secret|steg|secret-rev}/{모델파일명}/{0000.png,...}
 # - CSV/플롯: 모델 파일과 같은 디렉토리에 저장 (eval_metrics.csv, eval_metrics.png)
+# - 플롯 형식: 1x5 패널 (PSNR_C, PSNR_R, SSIM_C, SSIM_R, SSIM_AVG)
 
 import os
 import math
@@ -13,10 +14,10 @@ from typing import Tuple, List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.ao.quantization as tq
 from PIL import Image
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 
 import config as c
 from hinet import Hinet
@@ -24,14 +25,14 @@ from invblock import INV_block
 from rrdb_denselayer import ResidualDenseBlock_out
 
 # ===== 사용자 변경 구역 =====
-MODEL_PATH = "/root/Desktop/HiNet/logging/qat_qbackend_safe_20250812_172026_ep50_calib128/hinet_qat_int8_full.pt"
+MODEL_PATH = "/root/Desktop/HiNet/model/pretrained_QAT_scripted.pt"
 BASE_OUT_DIR = "/root/Desktop/HiNet/image"
 # ==========================
 
 def logit(msg: str):
     print(f"{datetime.now():%y-%m-%d %H:%M:%S} - INFO: {msg}")
 
-# 저장 당시 클래스 이름을 맞추기 위한 안전망 (eager .pt 로드 시 필요할 수 있음)
+# 저장 당시 클래스 이름을 맞추기 위한 안전망
 class QATWrapper(nn.Module):
     def __init__(self, core: nn.Module = None):
         super().__init__()
@@ -47,19 +48,10 @@ class QATWrapper(nn.Module):
 # -------------- DWT / iDWT --------------
 @torch.no_grad()
 def haar_dwt(x: torch.Tensor) -> torch.Tensor:
-    """
-    x: [B, C, H, W]
-    - H, W가 홀수면 reflect 패딩으로 짝수화 (크롭하지 않음)
-    - 결과: [B, 4C, H/2, W/2]
-    """
     B, C, H, W = x.shape
-    pad_h = H % 2
-    pad_w = W % 2
-    if pad_h or pad_w:
-        # F.pad order: (w_left, w_right, h_top, h_bottom)
-        x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
-        B, C, H, W = x.shape
-
+    # DWT는 짝수 해상도 필요
+    if (H % 2) != 0 or (W % 2) != 0:
+        pad_h = (0, (W % 2 != 0))  # dummy to avoid flake, not used
     x00 = x[:, :, 0::2, 0::2]
     x01 = x[:, :, 0::2, 1::2]
     x10 = x[:, :, 1::2, 0::2]
@@ -72,9 +64,6 @@ def haar_dwt(x: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def inv_haar_dwt(d: torch.Tensor) -> torch.Tensor:
-    """
-    d: [B, 4C, H/2, W/2] -> [B, C, H, W]
-    """
     B, C4, H2, W2 = d.shape
     C = C4 // 4
     ll, lh, hl, hh = torch.chunk(d, 4, dim=1)
@@ -90,15 +79,10 @@ def inv_haar_dwt(d: torch.Tensor) -> torch.Tensor:
     return out
 
 def make_input(secret: torch.Tensor, cover: torch.Tensor) -> torch.Tensor:
-    """
-    입력 텐서 준비: x = [secret_dwt, cover_dwt]
-    - secret은 이미 cover 크기로 리사이즈됨 (main에서 보장)
-    - DWT는 내부에서 패딩으로 짝수 보장
-    """
     sd = haar_dwt(secret)
     cd = haar_dwt(cover)
-    x = torch.cat([sd, cd], dim=1)  # [B, 24, h, w]
-    return x
+    # 학습과 동일한 채널 순서: [secret_dwt, cover_dwt]
+    return torch.cat([sd, cd], dim=1)
 
 # -------------- Metrics --------------
 def psnr(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> float:
@@ -129,6 +113,37 @@ def to_uint8_image(t: torch.Tensor) -> Image.Image:
 def save_image_tensor(t: torch.Tensor, out_dir: str, fname: str):
     ensure_dir(out_dir)
     to_uint8_image(t).save(os.path.join(out_dir, fname))
+
+# --------- Pair prep: cover full-res / secret resize+pad-even ----------
+def _pad_to_even_pil(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    pad_right = 1 if (w % 2) else 0
+    pad_bottom = 1 if (h % 2) else 0
+    if pad_right == 0 and pad_bottom == 0:
+        return img
+    new_im = Image.new("RGB", (w + pad_right, h + pad_bottom))
+    new_im.paste(img, (0, 0))
+    # 가장자리 복제
+    if pad_right:
+        strip = img.crop((w - 1, 0, w, h)).resize((1, h))
+        new_im.paste(strip, (w, 0))
+    if pad_bottom:
+        strip = img.crop((0, h - 1, w, h)).resize((w, 1))
+        new_im.paste(strip, (0, h))
+    if pad_right and pad_bottom:
+        pix = img.getpixel((w - 1, h - 1))
+        new_im.putpixel((w, h), pix)
+    return new_im
+
+def prepare_pair_full_cover(secret_img: Image.Image, cover_img: Image.Image) -> Tuple[Image.Image, Image.Image]:
+    # 커버 해상도 유지
+    Wc, Hc = cover_img.size
+    # 시크릿을 커버에 맞춰 리사이즈
+    secret_resized = secret_img.resize((Wc, Hc), Image.BICUBIC)
+    # 짝수화(둘 다 DWT 필요)
+    cover_even  = _pad_to_even_pil(cover_img)
+    secret_even = _pad_to_even_pil(secret_resized)
+    return secret_even, cover_even
 
 # -------------- Data --------------
 def load_eval_list(secret_dir: str, cover_dir: str, fmt: str) -> List[Tuple[str, str]]:
@@ -168,10 +183,6 @@ def build_int8_from_checkpoint(ckpt_path: str) -> nn.Module:
     return int8_model
 
 def load_model_any(model_path: str) -> nn.Module:
-    """
-    1) 같은 폴더의 last.pth가 있으면 이를 QAT->INT8로 변환해 사용
-    2) 없으면 eager .pt 를 그대로 로딩해서 사용 (추가 이동/순회/추가 eval 호출 안 함)
-    """
     model_dir = os.path.dirname(model_path)
     sib = os.path.join(model_dir, "last.pth")
     if os.path.isfile(sib):
@@ -183,7 +194,7 @@ def load_model_any(model_path: str) -> nn.Module:
 
     obj = torch.load(model_path, map_location="cpu")
     logit(f"[load] eager object loaded (CPU): {model_path}")
-    return obj  # 그대로 사용
+    return obj  # 추가 .to()/.eval() 호출 안 함
 
 # -------------- Main --------------
 def main():
@@ -201,7 +212,7 @@ def main():
     device = torch.device("cpu")
     print(f"Device: {device}")
 
-    model = load_model_any(MODEL_PATH)  # CPU 추론 객체 (eager or converted)
+    model = load_model_any(MODEL_PATH)  # CPU 추론 객체
 
     # 저장 경로
     model_tag = os.path.splitext(os.path.basename(MODEL_PATH))[0]
@@ -212,51 +223,52 @@ def main():
     for d in [out_cover_dir, out_secret_dir, out_steg_dir, out_secretrev_dir]:
         ensure_dir(d)
 
-    # 메트릭 저장
+    # 메트릭 모음
     psnr_c_all, psnr_r_all = [], []
     ssim_c_all, ssim_r_all = [], []
+
     to_tensor = T.ToTensor()
 
     with torch.no_grad():
         for idx, (sp, cp) in enumerate(pairs):
-            s_img = Image.open(sp).convert("RGB")
-            c_img = Image.open(cp).convert("RGB")
+            s_img_raw = Image.open(sp).convert("RGB")
+            c_img_raw = Image.open(cp).convert("RGB")
 
-            # === 커버 해상도 유지, 시크릿만 커버 크기로 리사이즈 ===
-            if s_img.size != c_img.size:
-                s_img = s_img.resize(c_img.size, Image.BICUBIC)
+            # 커버 풀해상도 유지, 시크릿 리사이즈+짝수화(패딩)
+            s_img, c_img = prepare_pair_full_cover(s_img_raw, c_img_raw)
 
             sb = to_tensor(s_img).unsqueeze(0)  # [1,3,H,W]
-            cb = to_tensor(c_img).unsqueeze(0)  # [1,3,H,W]
+            cb = to_tensor(c_img).unsqueeze(0)
 
-            x = make_input(sb, cb)             # [1,24,h,w]  (secret_dwt, cover_dwt)
+            x = make_input(sb, cb)             # [1,24,h,w]
             y = model(x, rev=False)            # 추론
 
-            # ===== 채널 분리: x = [secret_dwt, cover_dwt] =====
+            # 분리 규칙: (앞=secret_dwt, 뒤=cover_dwt) 이면?  → make_input에서 [secret, cover]로 합쳤으므로
+            # 모델 출력도 동일 정렬을 가정: y = [secret_dwt', cover_dwt']
             y_s_dwt, y_c_dwt = torch.chunk(y, 2, dim=1)
             x_s_dwt, x_c_dwt = torch.chunk(x, 2, dim=1)
 
             # 공간영역 복원
-            secret_ref = inv_haar_dwt(x_s_dwt)   # GT secret
-            cover_ref  = inv_haar_dwt(x_c_dwt)   # GT cover
-            secret_rev = inv_haar_dwt(y_s_dwt)   # 복원된 secret
-            steg_img   = inv_haar_dwt(y_c_dwt)   # stego(커버 쪽)
+            secret_ref = inv_haar_dwt(x_s_dwt)
+            cover_ref  = inv_haar_dwt(x_c_dwt)
+            secret_rev = inv_haar_dwt(y_s_dwt)
+            steg_img   = inv_haar_dwt(y_c_dwt)
 
-            # 메트릭 (PSNR/SSIM)
-            pc = psnr(steg_img, cover_ref)
-            pr = psnr(secret_rev, secret_ref)
-            sc = ssim_simple(steg_img, cover_ref)
-            sr = ssim_simple(secret_rev, secret_ref)
+            # 메트릭
+            psnr_c = psnr(steg_img, cover_ref)
+            psnr_r = psnr(secret_rev, secret_ref)
+            ssim_c = ssim_simple(steg_img, cover_ref)
+            ssim_r = ssim_simple(secret_rev, secret_ref)
 
-            psnr_c_all.append(pc); psnr_r_all.append(pr)
-            ssim_c_all.append(sc); ssim_r_all.append(sr)
+            psnr_c_all.append(psnr_c); psnr_r_all.append(psnr_r)
+            ssim_c_all.append(ssim_c); ssim_r_all.append(ssim_r)
 
-            # 저장(0000.png, 0001.png, ...)
+            # 저장(0000.png)
             name = f"{idx:04d}.png"
-            save_image_tensor(cover_ref,  out_cover_dir, name)      # 원본 cover
-            save_image_tensor(secret_ref, out_secret_dir, name)     # 원본 secret
-            save_image_tensor(steg_img,   out_steg_dir, name)       # stego
-            save_image_tensor(secret_rev, out_secretrev_dir, name)  # 복원 secret
+            save_image_tensor(cover_ref,  out_cover_dir,  name)
+            save_image_tensor(secret_ref, out_secret_dir, name)
+            save_image_tensor(steg_img,   out_steg_dir,   name)        # stego → steg/
+            save_image_tensor(secret_rev, out_secretrev_dir, name)     # recovered secret → secret-rev/
 
     # 집계
     avg_psnr_c = sum(psnr_c_all) / max(1, len(psnr_c_all))
@@ -272,7 +284,7 @@ def main():
     csv_path  = os.path.join(model_dir, "eval_metrics.csv")
     png_path  = os.path.join(model_dir, "eval_metrics.png")
 
-    # CSV
+    # CSV 저장
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["index", "PSNR_C(dB)", "PSNR_R(dB)", "SSIM_C", "SSIM_R"])
@@ -283,26 +295,25 @@ def main():
                     f"{avg_ssim_c:.6f}", f"{avg_ssim_r:.6f}", "SSIM_AVG", f"{avg_ssim:.6f}"])
     logit(f"saved CSV: {csv_path}")
 
-    # 플롯
+    # ===== 플롯: 1x5 패널 (예시 이미지 스타일) =====
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax1 = plt.subplots(figsize=(10, 5), dpi=160)
     xs = list(range(len(psnr_c_all)))
-    ax1.plot(xs, psnr_c_all, label="PSNR_C", linewidth=2)
-    ax1.plot(xs, psnr_r_all, label="PSNR_R", linewidth=2)
-    ax1.set_xlabel("Index"); ax1.set_ylabel("PSNR (dB)")
-    ax1.grid(True, linestyle="--", alpha=0.5)
+    ssim_avg_all = [(a + b) * 0.5 for a, b in zip(ssim_c_all, ssim_r_all)]
 
-    ax2 = ax1.twinx()
-    ax2.plot(xs, ssim_c_all, label="SSIM_C", linewidth=2, linestyle=":")
-    ax2.plot(xs, ssim_r_all, label="SSIM_R", linewidth=2, linestyle="-.")
-    ax2.set_ylabel("SSIM")
+    fig, axes = plt.subplots(1, 5, figsize=(24, 4), dpi=160)
+    titles = ["PSNR_C", "PSNR_R", "SSIM_C", "SSIM_R", "SSIM_AVG"]
+    series = [psnr_c_all, psnr_r_all, ssim_c_all, ssim_r_all, ssim_avg_all]
+    ylabels = ["PSNR (dB)", "PSNR (dB)", "SSIM", "SSIM", "SSIM"]
 
-    l1, t1 = ax1.get_legend_handles_labels()
-    l2, t2 = ax2.get_legend_handles_labels()
-    ax1.legend(l1 + l2, t1 + t2, loc="best")
+    for ax, title, vals, yl in zip(axes, titles, series, ylabels):
+        ax.plot(xs, vals, linewidth=2)
+        ax.set_title(title)
+        ax.set_xlabel("Image Index")
+        ax.set_ylabel(yl)
+        ax.grid(True, linestyle="--", alpha=0.5)
 
     fig.tight_layout()
     fig.savefig(png_path)
