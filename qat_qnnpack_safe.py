@@ -1,122 +1,86 @@
-# -*- coding: utf-8 -*-
-"""
-qat_qnnpack_safe.py
+# qat_qnnpack_safe.py
+# QAT + static quant convert + 10-epoch checkpoint + resume + TorchScript export
+# - GPU 장치 고정 (코드 상단 GPU_ID로 제어)
+# - datasets.py의 build_dataloaders(seed=...) 사용
+# - (secret, cover) -> Haar DWT -> 채널 concat -> 모델 입력
+# - calibrate / train / eval 진행 로그
+# - 10 epoch마다 checkpoint(.pth) 저장 및 --resume로 이어서 학습
+# - 최종 int8 eager 모델(.pt)과 TorchScript(.pt) 저장 (변환은 반드시 CPU에서)
 
-Quantization-Aware Training (QAT) script for HiNet with:
- - **GPU selection in code** (no CLI): edit GPU_INDEX / PIN_VISIBLE_DEVICES below
- - Safe QConfig to avoid zero_point out-of-range
- - Progress logging with % indicator
- - Periodic checkpoint every N epochs + resume
- - Calibration + evaluation
- - Export eager INT8 (and optional TorchScript)
-
-Edit GPU at the top of this file:
-    GPU_INDEX = 0       # -1 for CPU, 0 or 1 ... for a single GPU
-    PIN_VISIBLE_DEVICES = False  # if True, sets CUDA_VISIBLE_DEVICES to GPU_INDEX
-"""
-
-# ----------------------------
-# EDIT HERE: GPU selection
-# ----------------------------
-import os as _os
-
-GPU_INDEX: int = 0              # -1 for CPU, otherwise the single GPU index you want
-PIN_VISIBLE_DEVICES: bool = False  # True: set CUDA_VISIBLE_DEVICES to this GPU, mapping it to cuda:0
-
-# Apply env var *before* importing torch
-if PIN_VISIBLE_DEVICES and GPU_INDEX >= 0:
-    _os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_INDEX)
-
-# ----------------------------
-
-import argparse
-import logging
-import math
 import os
-import sys
-from dataclasses import dataclass
+import math
+import copy
+import argparse
 from datetime import datetime
-from typing import Any, Dict, Tuple, Optional
+from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.ao.quantization as tq
 
-# explicit imports for safe qconfig
-from torch.ao.quantization.fake_quantize import FakeQuantize
-from torch.ao.quantization.observer import (
-    MovingAverageMinMaxObserver,
-    PerChannelMinMaxObserver,
-)
-
 import config as c
-from hinet import Hinet
-
+from datasets import build_dataloaders
+from hinet import Hinet  # 프로젝트의 HiNet 모델
 
 # ----------------------------
-# Logging / utils
+# 0) GPU 고정 (명령행 인자 없이)
 # ----------------------------
-def setup_logging(save_dir: str):
-    os.makedirs(save_dir, exist_ok=True)
-    log_path = os.path.join(save_dir, "train.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s: %(message)s",
-        datefmt="%y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_path, mode="a", encoding="utf-8"),
-        ],
-    )
-    logging.info("log file: %s", log_path)
+GPU_ID = 0  # <<<< 사용할 GPU 번호를 여기서 지정하세요 (예: 0)
 
+# ----------------------------
+# 1) 유틸
+# ----------------------------
+def now() -> str:
+    return datetime.now().strftime("%y-%m-%d %H:%M:%S")
 
-def select_engine() -> str:
-    """
-    Prefer FBGEMM on x86, fall back to QNNPACK on ARM.
-    """
-    engine = "fbgemm"
-    if torch.backends.quantized.supported_engines is not None:
-        if "fbgemm" in torch.backends.quantized.supported_engines:
-            engine = "fbgemm"
-        elif "qnnpack" in torch.backends.quantized.supported_engines:
-            engine = "qnnpack"
-    torch.backends.quantized.engine = engine
-    logging.info("quant backend engine: %s", engine)
-    return engine
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
+def logit(msg: str, logger=None):
+    print(f"{now()} - INFO: {msg}")
+    if logger is not None:
+        logger.write(f"{now()} - INFO: {msg}\n")
+        logger.flush()
 
-def psnr(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> float:
-    mse = torch.mean((a - b) ** 2).item()
+def psnr(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
+    mse = torch.mean((x - y) ** 2).item()
     if mse <= eps:
         return 99.0
     return 10.0 * math.log10(1.0 / mse)
 
+# ----------------------------
+# 2) Haar DWT (채널당 4배, H/2, W/2)
+# ----------------------------
+@torch.no_grad()
+def haar_dwt(x: torch.Tensor) -> torch.Tensor:
+    # x: [B, C, H, W]  ->  [B, 4C, H/2, W/2]
+    B, C, H, W = x.shape
+    assert H % 2 == 0 and W % 2 == 0, "H, W must be even for Haar DWT"
+    x00 = x[:, :, 0::2, 0::2]
+    x01 = x[:, :, 0::2, 1::2]
+    x10 = x[:, :, 1::2, 0::2]
+    x11 = x[:, :, 1::2, 1::2]
+    ll = (x00 + x01 + x10 + x11) * 0.5
+    lh = (x00 - x01 + x10 - x11) * 0.5
+    hl = (x00 + x01 - x10 - x11) * 0.5
+    hh = (x00 - x01 - x10 + x11) * 0.5
+    return torch.cat([ll, lh, hl, hh], dim=1)
 
-def strip_internal_qstubs(m: nn.Module):
-    """
-    Optionally remove *internal* QuantStub/DeQuantStub that are not needed anymore.
-    (boundary stubs are added by QATWrapper)
-    """
-    for name, child in list(m.named_children()):
-        if isinstance(child, (tq.QuantStub, tq.DeQuantStub)):
-            delattr(m, name)
-        else:
-            strip_internal_qstubs(child)
+def make_input(secret: torch.Tensor, cover: torch.Tensor) -> torch.Tensor:
+    # secret, cover: [B,3,H,W] in [0,1]
+    sd = haar_dwt(secret)  # [B,12,H/2,W/2]
+    cd = haar_dwt(cover)   # [B,12,H/2,W/2]
+    x = torch.cat([sd, cd], dim=1)  # [B,24,H/2,W/2]
+    return x
 
-
-def replace_leakyrelu_with_relu(m: nn.Module):
-    for name, child in m.named_children():
-        if isinstance(child, nn.LeakyReLU):
-            setattr(m, name, nn.ReLU(inplace=False))
-        else:
-            replace_leakyrelu_with_relu(child)
-
-
+# ----------------------------
+# 3) 모델 래퍼(QAT/양자화 경계 포함)
+# ----------------------------
 class QATWrapper(nn.Module):
     """
-    Add boundary Quant/DeQuant so the converted int8 model is drop-in
-    with FP32 input/output.
+    - 입력은 (secret, cover) -> DWT -> concat 이후 들어오도록 외부에서 준비.
+    - 래퍼는 모델 앞뒤에 QuantStub/DeQuantStub를 둠.
     """
     def __init__(self, core: nn.Module):
         super().__init__()
@@ -130,327 +94,263 @@ class QATWrapper(nn.Module):
         y = self.dequant(yq)
         return y
 
-
 # ----------------------------
-# **Safe** QConfig (fix for zero_point out-of-range)
+# 4) 학습/캘리브/평가 루프
 # ----------------------------
-def safe_qconfig() -> tq.QConfig:
-    """
-    Use explicit, conservative qconfig:
-      - Activations: quint8, per-tensor affine, MovingAverageMinMaxObserver
-      - Weights: qint8, per-channel *symmetric*, PerChannelMinMaxObserver
-    """
-    act_fq = FakeQuantize.with_args(
-        observer=MovingAverageMinMaxObserver,
-        dtype=torch.quint8,
-        qscheme=torch.per_tensor_affine,
-        reduce_range=False,
-        eps=1e-4,
-        quant_min=0,
-        quant_max=255,
-    )
-    w_fq = FakeQuantize.with_args(
-        observer=PerChannelMinMaxObserver,
-        dtype=torch.qint8,
-        qscheme=torch.per_channel_symmetric,
-        ch_axis=0,           # out_channels
-        reduce_range=False,
-        eps=1e-4,
-        quant_min=-128,
-        quant_max=127,
-    )
-    return tq.QConfig(activation=act_fq, weight=w_fq)
-
-
-def prepare_qat_safe(fp32_model: nn.Module) -> nn.Module:
-    """
-    Wrap with Quant/DeQuant stubs and prepare for QAT using the safe qconfig.
-    """
-    model = QATWrapper(fp32_model)
-    model.qconfig = safe_qconfig()
-    prepared = tq.prepare_qat(model, inplace=False)
-    return prepared
-
-
-def log_sample_qparams(model: nn.Module, prefix: str = "QCONFIG"):
-    """
-    Log a couple of activation/weight fake-quant configs to confirm dtypes/ranges.
-    """
-    act_seen = False
-    w_seen = False
-    for n, m in model.named_modules():
-        if isinstance(m, FakeQuantize):
-            logging.info(
-                "%s | %s | dtype=%s qscheme=%s qmin=%s qmax=%s",
-                prefix,
-                n,
-                getattr(m, "dtype", None),
-                getattr(m, "qscheme", None),
-                getattr(m, "quant_min", None),
-                getattr(m, "quant_max", None),
-            )
-            if not act_seen and m.dtype == torch.quint8:
-                act_seen = True
-            if not w_seen and m.dtype == torch.qint8:
-                w_seen = True
-        if act_seen and w_seen:
-            break
-
-
-# ----------------------------
-# Calib / Eval / Train
-# ----------------------------
-@torch.no_grad()
-def calibrate(model: nn.Module, num_batches: int = 32, device: str = "cpu"):
-    model.eval()
-    logging.info("calibrating observers with %d batches ...", num_batches)
-    for i in range(num_batches):
-        x = torch.rand(1, 3, 64, 64, device=device)
-        _ = model(x, rev=False)
-        _ = model(_, rev=True)
-        if (i + 1) % max(1, num_batches // 4) == 0:
-            logging.info("  calib %d/%d", i + 1, num_batches)
-    logging.info("calibration done.")
-
-
-def evaluate(model: nn.Module, device: str = "cpu") -> Tuple[float, float]:
-    model.eval()
-    with torch.no_grad():
-        x = torch.rand(1, 3, 64, 64, device=device)
-        y = model(x, rev=False)
-        x_rec = model(y, rev=True)
-        psnr_c = psnr(y.clamp(0, 1), y.clamp(0, 1))
-        psnr_s = psnr(x.clamp(0, 1), x_rec.clamp(0, 1))
-    return psnr_c, psnr_s
-
-
-def train_one_epoch(model: nn.Module, optimizer: torch.optim.Optimizer, device: str = "cpu",
-                    epoch: int = 0, iters: int = 96, show_progress: bool = True) -> float:
-    """
-    Dummy self-reconstruction training with synthetic pairs.
-    Replace with your real dataloader + loss.
-    """
+def train_one_epoch(model: nn.Module,
+                    device: torch.device,
+                    optim: optim.Optimizer,
+                    trainloader,
+                    epoch: int,
+                    total_epochs: int,
+                    show_progress: bool = False) -> float:
     model.train()
-    loss_fn = nn.L1Loss()
     running = 0.0
-    for it in range(1, iters + 1):
-        x = torch.rand(2, 3, 64, 64, device=device)
-        y = model(x, rev=False)
-        x_rec = model(y, rev=True)
-        loss = loss_fn(x_rec, x)
-        optimizer.zero_grad(set_to_none=True)
+    total = len(trainloader)
+    logit(f"TRAIN: start epoch {epoch}/{total_epochs}")
+
+    for i, (secret, cover) in enumerate(trainloader, 1):
+        if show_progress and (i % max(1, total // 10) == 0 or i == total):
+            pct = int(i * 100 / total)
+            logit(f"TRAIN: {pct}% ({i}/{total})")
+
+        secret = secret.to(device, non_blocking=True)
+        cover  = cover.to(device, non_blocking=True)
+        x = make_input(secret, cover)
+
+        # 단순 L1 복원 손실 (QAT 안정화 목적)
+        y = model(x)
+        loss = torch.nn.functional.l1_loss(y, x)
+
+        optim.zero_grad(set_to_none=True)
         loss.backward()
-        optimizer.step()
+        optim.step()
+
         running += loss.item()
 
-        if show_progress and (it % max(1, iters // 10) == 0 or it == iters):
-            pct = int(round(100.0 * it / iters))
-            logging.info("TRAIN: %d%% (%d/%d)", pct, it, iters)
+    avg = running / max(1, total)
+    logit(f"TRAIN: done | loss {avg:.4f}")
+    return avg
 
-    return running / iters
+@torch.no_grad()
+def calibrate(model: nn.Module, device: torch.device, trainloader, steps: int = 64, show_progress: bool = False):
+    model.eval()
+    logit(f"calibrating observers with {steps} batches ...")
+    seen = 0
+    total = steps
+    for i, (secret, cover) in enumerate(trainloader, 1):
+        secret = secret.to(device, non_blocking=True)
+        cover  = cover.to(device, non_blocking=True)
+        x = make_input(secret, cover)
+        _ = model(x, rev=False)
+        seen += 1
+        if show_progress and (seen % max(1, total // 5) == 0 or seen == total):
+            pct = int(seen * 100 / total)
+            logit(f"CALIB: {pct}% ({seen}/{total})")
+        if seen >= steps:
+            break
+    logit("calibrate: done")
 
+@torch.no_grad()
+def evaluate(model: nn.Module, device: torch.device, valloader, show_progress: bool = False) -> Tuple[float, float]:
+    model.eval()
+    total_batches = len(valloader)
+    logit(f"EVAL: start (batches={total_batches})")
+    psnr_c_list, psnr_s_list = [], []
+
+    for i, (secret, cover) in enumerate(valloader, 1):
+        if show_progress and (i % max(1, total_batches // 5) == 0 or i == total_batches):
+            pct = int(i * 100 / total_batches)
+            logit(f"EVAL: {pct}% ({i}/{total_batches})")
+
+        secret = secret.to(device, non_blocking=True)
+        cover  = cover.to(device, non_blocking=True)
+        x = make_input(secret, cover)
+        y = model(x, rev=False)
+
+        y_c, y_s = torch.chunk(y, 2, dim=1)
+        x_c, x_s = torch.chunk(x, 2, dim=1)
+        psnr_c_list.append(psnr(y_c.clamp(0, 1).cpu(), x_c.clamp(0, 1).cpu()))
+        psnr_s_list.append(psnr(y_s.clamp(0, 1).cpu(), x_s.clamp(0, 1).cpu()))
+
+    psnr_c = sum(psnr_c_list) / max(1, len(psnr_c_list))
+    psnr_s = sum(psnr_s_list) / max(1, len(psnr_s_list))
+    logit("EVAL: done")
+    logit(f"EVAL | PSNR_C {psnr_c:.3f} dB | PSNR_S {psnr_s:.3f} dB")
+    return psnr_c, psnr_s
 
 # ----------------------------
-# Checkpoint helpers
+# 5) 체크포인트 I/O (10 epoch마다 저장)
 # ----------------------------
-def save_checkpoint(save_dir: str, epoch: int, model: nn.Module, optimizer: torch.optim.Optimizer, engine: str, extra: Optional[Dict[str, Any]] = None):
-    os.makedirs(save_dir, exist_ok=True)
+def save_checkpoint(save_dir: str, epoch: int, model: nn.Module, optimizer: optim.Optimizer, best: dict):
+    ensure_dir(save_dir)
     ckpt = {
         "epoch": epoch,
-        "engine": engine,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "save_dir": save_dir,
+        "best": best,
     }
-    if extra:
-        ckpt.update(extra)
-    path = os.path.join(save_dir, f"qat_ckpt_epoch{epoch:04d}.pth")
+    path = os.path.join(save_dir, f"checkpoint_ep{epoch:04d}.pth")
     torch.save(ckpt, path)
-    latest = os.path.join(save_dir, "latest.pth")
-    try:
-        tmp = latest + ".tmp"
-        torch.save({"path": os.path.basename(path)}, tmp)
-        os.replace(tmp, latest)
-    except Exception:
-        pass
-    logging.info("saved checkpoint: %s", path)
+    torch.save(ckpt, os.path.join(save_dir, "last.pth"))
+    logit(f"checkpoint saved: {path}")
 
-
-def load_checkpoint(resume_path: str) -> Dict[str, Any]:
-    if not os.path.isfile(resume_path):
-        raise FileNotFoundError(resume_path)
+def load_checkpoint(resume_path: str, model: nn.Module, optimizer: optim.Optimizer):
     ckpt = torch.load(resume_path, map_location="cpu")
-    if not isinstance(ckpt, dict) or "model_state" not in ckpt:
-        if isinstance(ckpt, dict) and "path" in ckpt:
-            root = os.path.dirname(resume_path)
-            resume_path = os.path.join(root, ckpt["path"])
-            ckpt = torch.load(resume_path, map_location="cpu")
-    return ckpt
-
+    model.load_state_dict(ckpt["model_state"])
+    if optimizer is not None and "optimizer_state" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+    start_epoch = int(ckpt.get("epoch", 0)) + 1
+    best = ckpt.get("best", {"psnr_c": -1, "psnr_s": -1})
+    logit(f"checkpoint loaded: {resume_path} (start from epoch {start_epoch})")
+    return start_epoch, best
 
 # ----------------------------
-# Single-GPU picker (from constants)
+# 6) QAT 준비/변환
 # ----------------------------
-def pick_device_from_constants() -> str:
+def choose_backend() -> str:
+    # 서버(x86)라면 fbgemm 우선, ARM 계열이면 qnnpack
+    engines = torch.backends.quantized.supported_engines
+    if "fbgemm" in engines:
+        return "fbgemm"
+    if "qnnpack" in engines:
+        return "qnnpack"
+    return engines[0] if engines else "fbgemm"
+
+def prepare_qat(model: nn.Module, backend: str):
+    torch.backends.quantized.engine = backend
+    model.qconfig = tq.get_default_qat_qconfig(backend)
+    tq.prepare_qat(model, inplace=True)
+    # 디버깅용 한두 개만 로깅
+    for name, mod in model.named_modules():
+        if hasattr(mod, "activation_post_process"):
+            ap = mod.activation_post_process
+            logit(f"INIT_QCONFIG | {name}.activation_post_process | dtype={getattr(ap, 'dtype', None)} "
+                  f"qscheme={getattr(ap, 'qscheme', None)} qmin={getattr(ap, 'quant_min', None)} qmax={getattr(ap, 'quant_max', None)}")
+            break
+    for name, mod in model.named_modules():
+        if hasattr(mod, "weight_fake_quant"):
+            wfq = mod.weight_fake_quant
+            logit(f"INIT_QCONFIG | {name}.weight_fake_quant | dtype={getattr(wfq, 'dtype', None)} "
+                  f"qscheme={getattr(wfq, 'qscheme', None)} qmin={getattr(wfq, 'quant_min', None)} qmax={getattr(wfq, 'quant_max', None)}")
+            break
+
+def convert_to_int8(model: nn.Module, backend: str) -> nn.Module:
     """
-    Decide device string from constants at the top of this file.
-      - GPU_INDEX < 0: force CPU
-      - GPU_INDEX >= 0: use that CUDA device (or 0 if out-of-range)
-      - If PIN_VISIBLE_DEVICES=True, the chosen device maps to cuda:0
+    - 항상 CPU에서 convert 수행
+    - 학습 모델을 건드리지 않도록 deepcopy 후 .cpu().eval()
     """
-    if GPU_INDEX < 0 or not torch.cuda.is_available():
-        return "cpu"
-    n = torch.cuda.device_count()
-    # When PIN_VISIBLE_DEVICES=True, that GPU is now visible as cuda:0
-    idx = 0 if PIN_VISIBLE_DEVICES else GPU_INDEX
-    if not PIN_VISIBLE_DEVICES and GPU_INDEX >= n:
-        print(f"[warn] GPU {GPU_INDEX} not available (device_count={n}); using 0.", file=sys.stderr)
-        idx = 0
-    torch.cuda.set_device(idx)
-    return f"cuda:{idx}"
-
+    torch.backends.quantized.engine = backend
+    model_cpu = copy.deepcopy(model).to("cpu").eval()
+    int8_model = tq.convert(model_cpu, inplace=False)
+    return int8_model
 
 # ----------------------------
-# Main
+# 7) 메인
 # ----------------------------
-def run(args):
-    # timestamp / save dir and logging first
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_dir = f"logging/qat_qbackend_safe_{timestamp}_ep{args.epochs}_calib{args.calib}"
-    save_dir = default_dir
-    os.makedirs(save_dir, exist_ok=True)
-    setup_logging(save_dir)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pretrained", type=str, default=None, help="FP32 pretrained .pt (state_dict or full)")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--calib", type=int, default=64)
+    parser.add_argument("--export-script", action="store_true")
+    parser.add_argument("--progress", action="store_true")
+    parser.add_argument("--save-every", type=int, default=10, help="save checkpoint every N epochs")
+    parser.add_argument("--resume", type=str, default=None, help="resume checkpoint path (.pth)")
+    args = parser.parse_args()
 
-    # device from constants
-    device = pick_device_from_constants()
-    if device.startswith("cuda"):
-        idx = int(device.split(":")[1])
-        logging.info("Using GPU %d: %s", idx, torch.cuda.get_device_name(idx))
+    # 로그 디렉토리
+    tag = f"qat_qbackend_safe_{datetime.now().strftime('%Y%m%d_%H%M%S')}_ep{args.epochs}_calib{args.calib}"
+    save_dir = os.path.join("logging", tag)
+    ensure_dir(save_dir)
+    log_path = os.path.join(save_dir, "train.log")
+    logger = open(log_path, "a", buffering=1)
+    logit(f"log file: {log_path}", logger)
+
+    # 디바이스 (코드 고정 GPU_ID)
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{GPU_ID}")
+        torch.cuda.set_device(GPU_ID)
+        logit(f"Using GPU {GPU_ID}: {torch.cuda.get_device_name(GPU_ID)}", logger)
     else:
-        logging.info("Using CPU.")
+        device = torch.device("cpu")
+        logit("Using CPU", logger)
 
-    engine = select_engine()
+    # 백엔드 선택
+    backend = choose_backend()
+    torch.backends.quantized.engine = backend
+    logit(f"quant backend engine: {backend}", logger)
 
-    # Build FP32 base
-    base = Hinet()
-    if args.strip_internal_qstubs:
-        strip_internal_qstubs(base)
-        logging.info("stripped internal Quant/DeQuant stubs")
-    if args.replace_leakyrelu:
-        replace_leakyrelu_with_relu(base)
-        logging.info("replaced LeakyReLU -> ReLU")
+    # 데이터 로더
+    trainloader, valloader = build_dataloaders(seed=getattr(c, "seed", 1234))
 
+    # 모델 생성 및 래핑
+    core = Hinet()
+    model = QATWrapper(core).to(device)
+
+    # 사전학습 로드(있으면)
+    if args.pretrained and os.path.isfile(args.pretrained):
+        try:
+            sd = torch.load(args.pretrained, map_location="cpu")
+            if isinstance(sd, dict) and "state_dict" in sd:
+                sd = sd["state_dict"]
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            logit(f"loaded pretrained FP32: {args.pretrained}", logger)
+            if isinstance(missing, list) and len(missing) > 0:
+                logit(f"  missing keys: {len(missing)}", logger)
+            if isinstance(unexpected, list) and len(unexpected) > 0:
+                logit(f"  unexpected keys: {len(unexpected)}", logger)
+        except Exception as e:
+            logit(f"pretrained load failed: {e}", logger)
+
+    # QAT 준비
+    prepare_qat(model, backend=backend)
+
+    # 옵티마이저
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    # resume
     start_epoch = 1
+    best = {"psnr_c": -1.0, "psnr_s": -1.0}
+    if args.resume and os.path.isfile(args.resume):
+        start_epoch, best = load_checkpoint(args.resume, model, optimizer)
 
-    # ----- Resume from QAT checkpoint -----
-    if args.resume:
-        ckpt = load_checkpoint(args.resume)
-        if "engine" in ckpt:
-            engine = ckpt["engine"]
-            torch.backends.quantized.engine = engine
+    # 캘리브 (trainloader에서 정확히 steps 만큼)
+    calibrate(model, device, trainloader, steps=args.calib, show_progress=args.progress)
 
-        qmodel = prepare_qat_safe(base)
-        qmodel.to(device)
-
-        missing, unexpected = qmodel.load_state_dict(ckpt["model_state"], strict=False)
-        if missing or unexpected:
-            logging.warning("state_dict restored with missing=%s unexpected=%s", missing, unexpected)
-
-        optimizer = torch.optim.Adam(qmodel.parameters(), lr=args.lr)
-        if "optimizer_state" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state"])
-            except Exception as e:
-                logging.warning("optimizer state load failed: %s", e)
-
-        if "save_dir" in ckpt:
-            save_dir = ckpt["save_dir"]
-
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        logging.info("resumed from %s (epoch %d)", args.resume, start_epoch - 1)
-        log_sample_qparams(qmodel, prefix="RESUME_QCONFIG")
-
-    else:
-        # Optional pretrained FP32 load
-        ckpt_path = os.path.join(c.MODEL_PATH, c.suffix) if args.pretrained is None else args.pretrained
-        if ckpt_path and os.path.isfile(ckpt_path):
-            sd = torch.load(ckpt_path, map_location="cpu")
-            if isinstance(sd, dict):
-                for top in ("net", "state_dict", "model"):
-                    if top in sd and isinstance(sd[top], dict):
-                        sd = sd[top]
-                        break
-            try:
-                base.load_state_dict(sd, strict=False)
-                logging.info("loaded pretrained FP32: %s", ckpt_path)
-            except Exception as e:
-                logging.warning("failed to load pretrained (%s): %s", ckpt_path, e)
-
-        qmodel = prepare_qat_safe(base)
-        qmodel.to(device)
-
-        logging.info("save_dir: %s", save_dir)
-        log_sample_qparams(qmodel, prefix="INIT_QCONFIG")
-
-        calibrate(qmodel, num_batches=args.calib, device=device)
-        optimizer = torch.optim.Adam(qmodel.parameters(), lr=args.lr)
-
-    # ----- Train -----
+    # 학습 루프
     for epoch in range(start_epoch, args.epochs + 1):
-        avg_loss = train_one_epoch(
-            qmodel, optimizer, device=device,
-            epoch=epoch, iters=args.iters, show_progress=args.progress
-        )
-        logging.info("epoch %03d | avg_loss %.6f", epoch, avg_loss)
+        _ = train_one_epoch(model, device, optimizer, trainloader, epoch, args.epochs, show_progress=args.progress)
+        psnr_c, psnr_s = evaluate(model, device, valloader, show_progress=True)
 
-        if args.eval_every > 0 and (epoch % args.eval_every == 0 or epoch == args.epochs):
-            psnr_c, psnr_s = evaluate(qmodel, device=device)
-            logging.info("EVAL | PSNR_C %.3f dB | PSNR_S %.3f dB", psnr_c, psnr_s)
+        best["psnr_c"] = max(best["psnr_c"], psnr_c)
+        best["psnr_s"] = max(best["psnr_s"], psnr_s)
 
-        if args.checkpoint_every > 0 and (epoch % args.checkpoint_every == 0 or epoch == args.epochs):
-            save_checkpoint(save_dir, epoch, qmodel, optimizer, engine, extra={"args": vars(args)})
+        # 체크포인트 저장 (매 N epoch)
+        if (epoch % max(1, args.save_every) == 0) or (epoch == args.epochs):
+            save_checkpoint(save_dir, epoch, model, optimizer, best)
 
-    # ----- Export INT8 -----
-    qmodel.eval()
-    int8_model = tq.convert(qmodel, inplace=False)
-    int8_path = os.path.join(save_dir, "hinet_qat_int8_full.pt")
-    torch.save(int8_model, int8_path)
-    logging.info("saved full int8 model: %s", int8_path)
+    # ===== 학습 완료 후에만 INT8 변환/스크립트 =====
+    int8_model = convert_to_int8(model, backend=backend).eval()
+    psnr_c, psnr_s = evaluate(int8_model, torch.device("cpu"), valloader, show_progress=True)
+    logit(f"EVAL | PSNR_C {psnr_c:.3f} dB | PSNR_S {psnr_s:.3f} dB", logger)
 
+    # 저장 (eager)
+    eager_path = os.path.join(save_dir, "hinet_qat_int8_full.pt")
+    torch.save(int8_model, eager_path)
+    logit(f"saved full int8 model: {eager_path}", logger)
+
+    # TorchScript export (옵션)
     if args.export_script:
-        scripted = torch.jit.script(int8_model)
-        ts_path = os.path.join(save_dir, "hinet_qat_int8_scripted.pt")
-        scripted.save(ts_path)
-        logging.info("saved TorchScript int8: %s", ts_path)
+        try:
+            scripted = torch.jit.script(int8_model)
+            ts_path = os.path.join(save_dir, "hinet_qat_int8_scripted.pt")
+            scripted.save(ts_path)
+            logit(f"saved TorchScript int8: {ts_path}", logger)
+        except Exception as e:
+            logit(f"TorchScript export failed: {e}", logger)
 
+    logger.close()
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pretrained", type=str, default=None, help="FP32 checkpoint path (optional)")
-    ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--iters", type=int, default=96, help="iters per epoch for the toy loop")
-    ap.add_argument("--calib", type=int, default=128, help="calibration mini-batches for observers")
-    ap.add_argument("--eval-every", type=int, default=1)
-    ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--replace-leakyrelu", action="store_true")
-    ap.add_argument("--strip-internal-qstubs", dest="strip_internal_qstubs", action="store_true")
-
-    # checkpoint / resume
-    ap.add_argument("--checkpoint-every", type=int, default=10, help="save QAT checkpoint every N epochs")
-    ap.add_argument("--resume", type=str, default=None, help="path to qat_ckpt_epochXXXX.pth or latest.pth")
-
-    # misc
-    ap.add_argument("--progress", action="store_true", help="log per-epoch progress (%)")
-    ap.add_argument("--export-script", action="store_true")
-    args = ap.parse_args()
-    run(args)
-
-# Usage:
-# 1) 파일 맨 위의 GPU_INDEX / PIN_VISIBLE_DEVICES 값만 수정하고
-# 2) 평소처럼 실행:
-#    python qat_qnnpack_safe.py --epochs 50 --calib 128 --checkpoint-every 10 --progress --export-script
-#
-# 예:
-#  - GPU 1 한 장만 쓰고 싶으면: GPU_INDEX = 1, PIN_VISIBLE_DEVICES = True  (cuda:0로 매핑)
-#  - 특정 장을 직접 지정하고 싶으면: GPU_INDEX = 2, PIN_VISIBLE_DEVICES = False (device='cuda:2')
-#  - CPU로 강제: GPU_INDEX = -1
+    main()
