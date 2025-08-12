@@ -1,89 +1,181 @@
-import re
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
+# 경로를 '여기서' 설정합니다. (명령줄 인자 없음)
+# [모드 A] 특정 세션/로그를 직접 지정
+SESSION_DIR = '/root/Desktop/HiNet/logging/qat_qbackend_safe_20250812_161125_ep50_calib128'  # 예: "/root/Desktop/HiNet/logging/qat_qbackend_safe_20250812_142025_ep5_calib128"
+LOG_PATH    = None  # 예: "/root/Desktop/HiNet/logging/.../train.log"  (SESSION_DIR보다 우선)
+OUT_PATH    = None  # 예: "/root/Desktop/HiNet/metrics_from_log.png" (미지정 시 <세션>/metrics_from_log.png로 저장)
 
-# 파일명과 레이블을 리스트로 준비
-files = [
-    ("./logging/train__211224-105010.log", "FP32"),
-    ("./logging/train__8bit_ep50_calib20.log", "8bit"),
-    ("./logging/train__4bit_ep50_calib20.log", "4bit"),
-]
+# [모드 B] 최신 세션 자동 탐색 (A를 쓰면 무시)
+AUTO_FIND_LAST = True
+ROOT_LOG_DIR   = "logging"   # 최신 세션을 찾을 상위 폴더
 
-def extract_psnr_loss(filename):
-    psnr_r, psnr_s = [], []
-    total_loss = None
-    psnr_pattern = re.compile(r"PSNR_S:\s*([-\d\.]+)\s*\|\s*PSNR_C:\s*([-\d\.]+)")
-    loss_pattern = re.compile(r"Train epoch \d+:\s+Loss: ([\d\.]+)")
-    with open(filename, encoding="utf-8") as f:
+# ------------------------------------------------------------
+# 아래부터는 수정 불필요
+import os, re, json, glob, math
+
+def is_empty_history(d):
+    if not isinstance(d, dict):
+        return True
+    keys = ("epoch","loss","psnr_c","psnr_r")
+    has_any = False
+    for k in keys:
+        v = d.get(k, [])
+        if isinstance(v, list) and len(v) > 0:
+            has_any = True
+            break
+    return not has_any
+
+def load_history_json(session_dir):
+    hist_path = os.path.join(session_dir, "history.json")
+    if not os.path.isfile(hist_path):
+        return None
+    try:
+        with open(hist_path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        # 값이 비어있으면 사용하지 않음 (로그 파싱으로 폴백)
+        if is_empty_history(j):
+            return None
+        # 키 가드 & 정렬
+        out = {
+            "epoch": list(j.get("epoch", [])),
+            "loss":  list(j.get("loss", [])),
+            "psnr_c": list(j.get("psnr_c", [])),
+            "psnr_r": list(j.get("psnr_r", [])),
+        }
+        return out
+    except Exception:
+        return None
+
+def parse_train_log(log_path):
+    # 예시 라인:
+    # 25-08-12 14:13:32 - INFO: TRAIN: done | loss 0.0135
+    # 25-08-12 14:13:36 - INFO: EVAL | PSNR_C 37.322 dB | PSNR_S 38.831 dB
+    # (PSNR_R 라벨로 출력되는 경우도 지원)
+    loss_pat = re.compile(r"TRAIN:\s*done\s*\|\s*loss\s*([0-9eE\.\-]+)")
+    eval_cs  = re.compile(r"EVAL\s*\|\s*PSNR_C\s*([0-9eE\.\-]+)\s*dB\s*\|\s*PSNR_S\s*([0-9eE\.\-]+)\s*dB")
+    eval_cr  = re.compile(r"EVAL\s*\|\s*PSNR_C\s*([0-9eE\.\-]+)\s*dB\s*\|\s*PSNR_R\s*([0-9eE\.\-]+)\s*dB")
+
+    losses, psnr_c, psnr_r = [], [], []
+    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            loss_match = loss_pattern.search(line)
-            if loss_match:
-                total_loss = float(loss_match.group(1))
-            psnr_match = psnr_pattern.search(line)
-            if psnr_match:
-                psnr_s.append(float(psnr_match.group(1)))
-                psnr_r.append(float(psnr_match.group(2)))
-    return psnr_r, psnr_s, total_loss
+            m = loss_pat.search(line)
+            if m:
+                try:
+                    losses.append(float(m.group(1)))
+                except Exception:
+                    pass
+            m = eval_cs.search(line)
+            if m:
+                try:
+                    psnr_c.append(float(m.group(1)))
+                    psnr_r.append(float(m.group(2)))
+                except Exception:
+                    pass
+            else:
+                m = eval_cr.search(line)
+                if m:
+                    try:
+                        psnr_c.append(float(m.group(1)))
+                        psnr_r.append(float(m.group(2)))
+                    except Exception:
+                        pass
 
-# 원하는 x축 순서
-order = ["FP32", "4bit", "8bit"]
+    n = max(len(losses), len(psnr_c), len(psnr_r))
+    if n == 0:
+        raise RuntimeError(f"로그에서 유효한 항목을 찾지 못했습니다: {log_path}")
 
-summary = {}
-for filename, label in files:
-    psnr_r, psnr_s, final_total_loss = extract_psnr_loss(filename)
-    final_psnr_r = psnr_r[-1] if psnr_r else 0
-    final_psnr_s = psnr_s[-1] if psnr_s else 0
-    if final_psnr_r == 0 or final_psnr_s == 0:
-        print(f"경고: {label}에서 PSNR_S/PSNR_C 값을 찾지 못했습니다.")
-    summary[label] = {
-        "Model": label,
-        "Final_PSNR_R": final_psnr_r,
-        "Final_PSNR_S": final_psnr_s,
-        "Final_Total_Loss": final_total_loss
+    return {
+        "epoch": list(range(1, n + 1)),
+        "loss": losses,
+        "psnr_c": psnr_c,
+        "psnr_r": psnr_r,
     }
 
-# 순서에 맞게 리스트 재정렬
-model_names = []
-psnr_r_list = []
-psnr_s_list = []
-loss_list = []
-summary_list = []
+def find_latest_session(root_dir):
+    # train.log 수정 시간이 최신인 세션 선택
+    pattern = os.path.join(root_dir, "qat_qbackend_safe_*", "train.log")
+    cands = glob.glob(pattern)
+    if not cands:
+        return None
+    cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return os.path.dirname(cands[0])
 
-for label in order:
-    model_names.append(label)
-    psnr_r_list.append(summary[label]["Final_PSNR_R"])
-    psnr_s_list.append(summary[label]["Final_PSNR_S"])
-    loss_list.append(summary[label]["Final_Total_Loss"])
-    summary_list.append(summary[label])
+def resolve_paths():
+    # 우선순위: LOG_PATH 직접 지정 > SESSION_DIR 지정 > 자동탐색
+    if LOG_PATH:
+        if not os.path.isfile(LOG_PATH):
+            raise FileNotFoundError(f"LOG_PATH not found: {LOG_PATH}")
+        session_dir = os.path.dirname(os.path.abspath(LOG_PATH))
+        out_path = OUT_PATH or os.path.join(session_dir, "metrics_from_log.png")
+        return session_dir, LOG_PATH, out_path
 
-# Bar chart
-x = np.arange(len(model_names))
-width = 0.35
+    if SESSION_DIR:
+        log_path = os.path.join(SESSION_DIR, "train.log")
+        if not os.path.isfile(log_path):
+            raise FileNotFoundError(f"train.log not found under SESSION_DIR: {log_path}")
+        out_path = OUT_PATH or os.path.join(SESSION_DIR, "metrics_from_log.png")
+        return SESSION_DIR, log_path, out_path
 
-fig, ax = plt.subplots(figsize=(8, 6))
-rects1 = ax.bar(x - width/2, psnr_r_list, width, label='PSNR_C', color='#1f77b4')
-rects2 = ax.bar(x + width/2, psnr_s_list, width, label='PSNR_S', color='#ff7f0e')
+    if AUTO_FIND_LAST:
+        session_dir = find_latest_session(ROOT_LOG_DIR)
+        if not session_dir:
+            raise FileNotFoundError(f"No train.log found under: {ROOT_LOG_DIR}")
+        log_path = os.path.join(session_dir, "train.log")
+        out_path = OUT_PATH or os.path.join(session_dir, "metrics_from_log.png")
+        return session_dir, log_path, out_path
 
-ax.set_ylabel('PSNR (dB)')
-ax.set_title('FP32 / 4bit / 8bit QAT Experiments')
-ax.set_xticks(x)
-ax.set_xticklabels(model_names)
-ax.legend()
+    raise RuntimeError("경로 설정 필요: SESSION_DIR 또는 LOG_PATH 지정하세요.")
 
-for rect in rects1 + rects2:
-    height = rect.get_height()
-    ax.annotate(f'{height:.2f}',
-                xy=(rect.get_x() + rect.get_width() / 2, height),
-                xytext=(0, 3),
-                textcoords="offset points",
-                ha='center', va='bottom', fontsize=10)
+def _pad(arr, n):
+    arr = list(arr)
+    if len(arr) < n:
+        arr += [float("nan")] * (n - len(arr))
+    return arr[:n]
 
-plt.tight_layout()
-plt.savefig("./logging/psnr_bar_comparison.png")
-plt.show()
+def plot_history(hist, out_path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-# CSV 저장
-df = pd.DataFrame(summary_list)
-df.to_csv("./loggingfinal_psnr_loss_summary.csv", index=False)
-print(df)
+    n = max(
+        len(hist.get("epoch", [])),
+        len(hist.get("loss", [])),
+        len(hist.get("psnr_c", [])),
+        len(hist.get("psnr_r", [])),
+        1,
+    )
+    ep     = _pad(hist.get("epoch", []), n) or list(range(1, n + 1))
+    loss   = _pad(hist.get("loss", []), n)
+    psnr_c = _pad(hist.get("psnr_c", []), n)
+    psnr_r = _pad(hist.get("psnr_r", []), n)
+
+    # 예시 이미지와 유사한 레이아웃/스타일
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=140, sharex=True)
+    for ax in axes:
+        ax.grid(True, linestyle="--", alpha=0.6)
+
+    axes[0].plot(ep, psnr_c, linewidth=2)
+    axes[0].set_title("PSNR_C"); axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("dB")
+
+    axes[1].plot(ep, psnr_r, linewidth=2, color="red")
+    axes[1].set_title("PSNR_S"); axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("dB")
+
+    axes[2].plot(ep, loss, linewidth=2)
+    axes[2].set_title("Train Loss"); axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Loss")
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"[OK] saved: {out_path} (points: loss={sum(math.isfinite(x) for x in loss)}, "
+          f"psnr_c={sum(math.isfinite(x) for x in psnr_c)}, psnr_s={sum(math.isfinite(x) for x in psnr_r)})")
+
+def main():
+    session_dir, log_path, out_path = resolve_paths()
+    # history.json이 있으면 쓰되 비어있으면 로그 파싱으로 폴백
+    hist = load_history_json(session_dir)
+    if hist is None:
+        hist = parse_train_log(log_path)
+    plot_history(hist, out_path)
+
+if __name__ == "__main__":
+    main()

@@ -1,18 +1,18 @@
 # qat_qnnpack_safe.py
-# QAT + static quant convert + 10-epoch checkpoint + resume + TorchScript export
-# - GPU 장치 고정 (코드 상단 GPU_ID로 제어)
-# - datasets.py의 build_dataloaders(seed=...) 사용
-# - (secret, cover) -> Haar DWT -> 채널 concat -> 모델 입력
-# - calibrate / train / eval 진행 로그
-# - 10 epoch마다 checkpoint(.pth) 저장 및 --resume로 이어서 학습
-# - 최종 int8 eager 모델(.pt)과 TorchScript(.pt) 저장 (변환은 반드시 CPU에서)
+# QAT + convert INT8 + checkpoint(save/resume) + per-epoch metrics logging + single image plot
+# - GPU 고정 (코드 상단 GPU_ID)
+# - datasets.build_dataloaders() 사용: (secret, cover) -> DWT -> concat 입력
+# - 에폭별 loss/psnr_c/psnr_r 을 train.log 에 기록
+# - metrics.png(한 장)로 3개 지표 곡선 저장/갱신
+# - 10 epoch마다 체크포인트 저장, --resume 으로 이어서 학습
+# - convert는 CPU에서 수행, TorchScript 옵션 저장
 
 import os
 import math
 import copy
 import argparse
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, Dict, Any, List
 
 import torch
 import torch.nn as nn
@@ -26,7 +26,7 @@ from hinet import Hinet  # 프로젝트의 HiNet 모델
 # ----------------------------
 # 0) GPU 고정 (명령행 인자 없이)
 # ----------------------------
-GPU_ID = 0  # <<<< 사용할 GPU 번호를 여기서 지정하세요 (예: 0)
+GPU_ID = 2  # << 원하는 GPU 번호로 바꾸세요 (예: 0)
 
 # ----------------------------
 # 1) 유틸
@@ -38,9 +38,10 @@ def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
 def logit(msg: str, logger=None):
-    print(f"{now()} - INFO: {msg}")
+    line = f"{now()} - INFO: {msg}"
+    print(line)
     if logger is not None:
-        logger.write(f"{now()} - INFO: {msg}\n")
+        logger.write(line + "\n")
         logger.flush()
 
 def psnr(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
@@ -99,7 +100,7 @@ class QATWrapper(nn.Module):
 # ----------------------------
 def train_one_epoch(model: nn.Module,
                     device: torch.device,
-                    optim: optim.Optimizer,
+                    optimizer: optim.Optimizer,
                     trainloader,
                     epoch: int,
                     total_epochs: int,
@@ -122,9 +123,9 @@ def train_one_epoch(model: nn.Module,
         y = model(x)
         loss = torch.nn.functional.l1_loss(y, x)
 
-        optim.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        optim.step()
+        optimizer.step()
 
         running += loss.item()
 
@@ -155,7 +156,8 @@ def calibrate(model: nn.Module, device: torch.device, trainloader, steps: int = 
 def evaluate(model: nn.Module, device: torch.device, valloader, show_progress: bool = False) -> Tuple[float, float]:
     model.eval()
     total_batches = len(valloader)
-    logit(f"EVAL: start (batches={total_batches})")
+    total_images = len(valloader.dataset) if hasattr(valloader, "dataset") else total_batches
+    logit(f"EVAL: start (images={total_images}, batches={total_batches})")
     psnr_c_list, psnr_s_list = [], []
 
     for i, (secret, cover) in enumerate(valloader, 1):
@@ -168,6 +170,7 @@ def evaluate(model: nn.Module, device: torch.device, valloader, show_progress: b
         x = make_input(secret, cover)
         y = model(x, rev=False)
 
+        # 채널 분리 (앞: cover, 뒤: secret)
         y_c, y_s = torch.chunk(y, 2, dim=1)
         x_c, x_s = torch.chunk(x, 2, dim=1)
         psnr_c_list.append(psnr(y_c.clamp(0, 1).cpu(), x_c.clamp(0, 1).cpu()))
@@ -180,7 +183,7 @@ def evaluate(model: nn.Module, device: torch.device, valloader, show_progress: b
     return psnr_c, psnr_s
 
 # ----------------------------
-# 5) 체크포인트 I/O (10 epoch마다 저장)
+# 5) 체크포인트 I/O (N epoch마다 저장)
 # ----------------------------
 def save_checkpoint(save_dir: str, epoch: int, model: nn.Module, optimizer: optim.Optimizer, best: dict):
     ensure_dir(save_dir)
@@ -246,7 +249,64 @@ def convert_to_int8(model: nn.Module, backend: str) -> nn.Module:
     return int8_model
 
 # ----------------------------
-# 7) 메인
+# 7) 히스토리 & 플로팅
+# ----------------------------
+def init_history() -> Dict[str, List[float]]:
+    return {"epoch": [], "loss": [], "psnr_c": [], "psnr_r": []}  # psnr_r == secret PSNR
+
+def update_history(hist: Dict[str, List[float]], epoch: int, loss: float, psnr_c: float, psnr_r: float):
+    hist["epoch"].append(epoch)
+    hist["loss"].append(loss)
+    hist["psnr_c"].append(psnr_c)
+    hist["psnr_r"].append(psnr_r)
+
+def plot_history(hist: Dict[str, List[float]], out_path: str):
+    # headless 환경 대비
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if len(hist["epoch"]) == 0:
+        return
+
+    ep = hist["epoch"]
+    loss_list = hist["loss"]
+    psnr_c_list = hist["psnr_c"]
+    psnr_s_list = hist["psnr_r"]  # secret PSNR
+
+    # 3분할 패널: PSNR_C / PSNR_S / Train Loss
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=160, sharex=True)
+
+    # (1) PSNR_C
+    ax = axes[0]
+    ax.plot(ep, psnr_c_list, linewidth=2)  # 기본 파랑
+    ax.set_title("PSNR_C")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("dB")
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    # (2) PSNR_S
+    ax = axes[1]
+    ax.plot(ep, psnr_s_list, linewidth=2, color="red")
+    ax.set_title("PSNR_S")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("dB")
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    # (3) Train Loss
+    ax = axes[2]
+    ax.plot(ep, loss_list, linewidth=2)  # 기본 파랑
+    ax.set_title("Train Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+# ----------------------------
+# 8) 메인
 # ----------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -281,7 +341,7 @@ def main():
     torch.backends.quantized.engine = backend
     logit(f"quant backend engine: {backend}", logger)
 
-    # 데이터 로더
+    # 데이터 로더 (secret/cover 동기 변환 적용됨)
     trainloader, valloader = build_dataloaders(seed=getattr(c, "seed", 1234))
 
     # 모델 생성 및 래핑
@@ -318,11 +378,23 @@ def main():
     # 캘리브 (trainloader에서 정확히 steps 만큼)
     calibrate(model, device, trainloader, steps=args.calib, show_progress=args.progress)
 
+    # 히스토리
+    hist = init_history()
+    metrics_png = os.path.join(save_dir, "metrics.png")
+
     # 학습 루프
     for epoch in range(start_epoch, args.epochs + 1):
-        _ = train_one_epoch(model, device, optimizer, trainloader, epoch, args.epochs, show_progress=args.progress)
+        loss = train_one_epoch(model, device, optimizer, trainloader, epoch, args.epochs, show_progress=args.progress)
         psnr_c, psnr_s = evaluate(model, device, valloader, show_progress=True)
 
+        # 로그에 에폭별 지표 3개 기록
+        logit(f"EPOCH {epoch:03d} | loss {loss:.4f} | psnr_c {psnr_c:.3f} | psnr_r {psnr_s:.3f}", logger)
+
+        # 히스토리 갱신 & 그래프 저장(한 장)
+        update_history(hist, epoch, loss, psnr_c, psnr_s)
+        plot_history(hist, metrics_png)
+
+        # 베스트 갱신
         best["psnr_c"] = max(best["psnr_c"], psnr_c)
         best["psnr_s"] = max(best["psnr_s"], psnr_s)
 
@@ -333,7 +405,7 @@ def main():
     # ===== 학습 완료 후에만 INT8 변환/스크립트 =====
     int8_model = convert_to_int8(model, backend=backend).eval()
     psnr_c, psnr_s = evaluate(int8_model, torch.device("cpu"), valloader, show_progress=True)
-    logit(f"EVAL | PSNR_C {psnr_c:.3f} dB | PSNR_S {psnr_s:.3f} dB", logger)
+    logit(f"EVAL(INT8) | PSNR_C {psnr_c:.3f} dB | PSNR_R {psnr_s:.3f} dB", logger)
 
     # 저장 (eager)
     eager_path = os.path.join(save_dir, "hinet_qat_int8_full.pt")
@@ -353,4 +425,7 @@ def main():
     logger.close()
 
 if __name__ == "__main__":
+    # GPU 고정
+    if torch.cuda.is_available():
+        torch.cuda.set_device(GPU_ID)
     main()
