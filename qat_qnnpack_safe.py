@@ -3,16 +3,31 @@
 qat_qnnpack_safe.py
 
 Quantization-Aware Training (QAT) script for HiNet with:
- - Safe QNNPACK/FBGEMM engine selection
- - Explicit "safe" QConfig (fixes zero_point out-of-range during QAT)
- - Internal FP32 arithmetic guards live in invblock.py / rrdb_denselayer.py
- - Calibration + evaluation hooks
+ - **GPU selection in code** (no CLI): edit GPU_INDEX / PIN_VISIBLE_DEVICES below
+ - Safe QConfig to avoid zero_point out-of-range
  - Progress logging with % indicator
- - Periodic checkpoint every N epochs + resume from checkpoint
- - Final export: eager INT8 (and optional TorchScript)
+ - Periodic checkpoint every N epochs + resume
+ - Calibration + evaluation
+ - Export eager INT8 (and optional TorchScript)
 
-Replace your existing file with this whole script.
+Edit GPU at the top of this file:
+    GPU_INDEX = 0       # -1 for CPU, 0 or 1 ... for a single GPU
+    PIN_VISIBLE_DEVICES = False  # if True, sets CUDA_VISIBLE_DEVICES to GPU_INDEX
 """
+
+# ----------------------------
+# EDIT HERE: GPU selection
+# ----------------------------
+import os as _os
+
+GPU_INDEX: int = 0              # -1 for CPU, otherwise the single GPU index you want
+PIN_VISIBLE_DEVICES: bool = False  # True: set CUDA_VISIBLE_DEVICES to this GPU, mapping it to cuda:0
+
+# Apply env var *before* importing torch
+if PIN_VISIBLE_DEVICES and GPU_INDEX >= 0:
+    _os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_INDEX)
+
+# ----------------------------
 
 import argparse
 import logging
@@ -54,12 +69,6 @@ def setup_logging(save_dir: str):
         ],
     )
     logging.info("log file: %s", log_path)
-
-
-def set_cuda_visible_devices(gpus: Optional[str]):
-    if gpus is not None and gpus != "":
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpus
-        logging.info("CUDA_VISIBLE_DEVICES=%s", gpus)
 
 
 def select_engine() -> str:
@@ -130,7 +139,6 @@ def safe_qconfig() -> tq.QConfig:
     Use explicit, conservative qconfig:
       - Activations: quint8, per-tensor affine, MovingAverageMinMaxObserver
       - Weights: qint8, per-channel *symmetric*, PerChannelMinMaxObserver
-    This avoids zero_point drifting out of [quant_min, quant_max].
     """
     act_fq = FakeQuantize.with_args(
         observer=MovingAverageMinMaxObserver,
@@ -172,7 +180,6 @@ def log_sample_qparams(model: nn.Module, prefix: str = "QCONFIG"):
     w_seen = False
     for n, m in model.named_modules():
         if isinstance(m, FakeQuantize):
-            obs = type(m.activation_post_process) if hasattr(m, "activation_post_process") else None
             logging.info(
                 "%s | %s | dtype=%s qscheme=%s qmin=%s qmax=%s",
                 prefix,
@@ -282,16 +289,47 @@ def load_checkpoint(resume_path: str) -> Dict[str, Any]:
 
 
 # ----------------------------
+# Single-GPU picker (from constants)
+# ----------------------------
+def pick_device_from_constants() -> str:
+    """
+    Decide device string from constants at the top of this file.
+      - GPU_INDEX < 0: force CPU
+      - GPU_INDEX >= 0: use that CUDA device (or 0 if out-of-range)
+      - If PIN_VISIBLE_DEVICES=True, the chosen device maps to cuda:0
+    """
+    if GPU_INDEX < 0 or not torch.cuda.is_available():
+        return "cpu"
+    n = torch.cuda.device_count()
+    # When PIN_VISIBLE_DEVICES=True, that GPU is now visible as cuda:0
+    idx = 0 if PIN_VISIBLE_DEVICES else GPU_INDEX
+    if not PIN_VISIBLE_DEVICES and GPU_INDEX >= n:
+        print(f"[warn] GPU {GPU_INDEX} not available (device_count={n}); using 0.", file=sys.stderr)
+        idx = 0
+    torch.cuda.set_device(idx)
+    return f"cuda:{idx}"
+
+
+# ----------------------------
 # Main
 # ----------------------------
 def run(args):
-    set_cuda_visible_devices(args.gpus)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    engine = select_engine()
+    # timestamp / save dir and logging first
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     default_dir = f"logging/qat_qbackend_safe_{timestamp}_ep{args.epochs}_calib{args.calib}"
     save_dir = default_dir
+    os.makedirs(save_dir, exist_ok=True)
+    setup_logging(save_dir)
+
+    # device from constants
+    device = pick_device_from_constants()
+    if device.startswith("cuda"):
+        idx = int(device.split(":")[1])
+        logging.info("Using GPU %d: %s", idx, torch.cuda.get_device_name(idx))
+    else:
+        logging.info("Using CPU.")
+
+    engine = select_engine()
 
     # Build FP32 base
     base = Hinet()
@@ -328,7 +366,6 @@ def run(args):
         if "save_dir" in ckpt:
             save_dir = ckpt["save_dir"]
 
-        setup_logging(save_dir)
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         logging.info("resumed from %s (epoch %d)", args.resume, start_epoch - 1)
         log_sample_qparams(qmodel, prefix="RESUME_QCONFIG")
@@ -352,7 +389,6 @@ def run(args):
         qmodel = prepare_qat_safe(base)
         qmodel.to(device)
 
-        setup_logging(save_dir)
         logging.info("save_dir: %s", save_dir)
         log_sample_qparams(qmodel, prefix="INIT_QCONFIG")
 
@@ -403,16 +439,18 @@ if __name__ == "__main__":
     ap.add_argument("--checkpoint-every", type=int, default=10, help="save QAT checkpoint every N epochs")
     ap.add_argument("--resume", type=str, default=None, help="path to qat_ckpt_epochXXXX.pth or latest.pth")
 
-    # device / misc
-    ap.add_argument("--gpus", type=str, default=None, help='GPU list like "0,1" (sets CUDA_VISIBLE_DEVICES)')
+    # misc
     ap.add_argument("--progress", action="store_true", help="log per-epoch progress (%)")
     ap.add_argument("--export-script", action="store_true")
     args = ap.parse_args()
     run(args)
 
-# Examples:
-# 1) fresh
-# python qat_qnnpack_safe.py --epochs 50 --calib 128 --checkpoint-every 10 --progress --export-script --strip-internal-qstubs
+# Usage:
+# 1) 파일 맨 위의 GPU_INDEX / PIN_VISIBLE_DEVICES 값만 수정하고
+# 2) 평소처럼 실행:
+#    python qat_qnnpack_safe.py --epochs 50 --calib 128 --checkpoint-every 10 --progress --export-script
 #
-# 2) resume
-# python qat_qnnpack_safe.py --resume logging/.../latest.pth --epochs 50 --checkpoint-every 10 --progress
+# 예:
+#  - GPU 1 한 장만 쓰고 싶으면: GPU_INDEX = 1, PIN_VISIBLE_DEVICES = True  (cuda:0로 매핑)
+#  - 특정 장을 직접 지정하고 싶으면: GPU_INDEX = 2, PIN_VISIBLE_DEVICES = False (device='cuda:2')
+#  - CPU로 강제: GPU_INDEX = -1
